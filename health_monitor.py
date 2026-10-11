@@ -7,6 +7,7 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
@@ -28,9 +29,7 @@ DEFAULT_THRESHOLDS = {
 
 
 def setup_logging():
-    """Configure rotating file logging."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
+    """Configure rotating file logging with a stderr fallback."""
     logger = logging.getLogger("health_monitor")
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -38,22 +37,31 @@ def setup_logging():
     if logger.handlers:
         return logger
 
-    handler = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8",
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
 
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
         )
-    )
+    except OSError as error:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.warning(
+            "File logging unavailable; using stderr instead: %s",
+            error,
+        )
+        return logger
 
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
     return logger
-
 
 def run_command(command, timeout=8):
     try:

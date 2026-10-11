@@ -201,6 +201,27 @@ class LoggingTests(unittest.TestCase):
             )
 
 
+    def test_logging_falls_back_to_stderr(self):
+        with (
+            patch(
+                "pathlib.Path.mkdir",
+                side_effect=PermissionError("Permission denied"),
+            ),
+            patch("health_monitor.sys.stderr") as mocked_stderr,
+        ):
+            logger = health_monitor.setup_logging()
+
+            self.assertTrue(
+                any(
+                    isinstance(handler, logging.StreamHandler)
+                    for handler in logger.handlers
+                )
+            )
+
+            logger.warning("Fallback logging test")
+            mocked_stderr.write.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 
