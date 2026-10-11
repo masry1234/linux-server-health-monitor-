@@ -222,6 +222,43 @@ class LoggingTests(unittest.TestCase):
             mocked_stderr.write.assert_called()
 
 
+class HtmlReportTests(unittest.TestCase):
+    def test_html_report_displays_resource_and_systemd_status(self):
+        report = {
+            "timestamp_utc": "2026-10-11T10:00:00Z",
+            "system": {"hostname": "test-server"},
+            "health": {"status": "OK"},
+            "system_diagnostics": {"systemd_status": "degraded"},
+        }
+
+        result = health_monitor.generate_html_report(report)
+
+        self.assertIn("Resource health: OK", result)
+        self.assertIn("Systemd status: degraded", result)
+        self.assertIn("test-server", result)
+        self.assertIn("Full diagnostic report", result)
+
+    def test_html_report_escapes_untrusted_content(self):
+        report = {
+            "timestamp_utc": "2026-10-11T10:00:00Z",
+            "system": {"hostname": "<script>alert(1)</script>"},
+            "health": {"status": "OK"},
+            "system_diagnostics": {
+                "systemd_status": "healthy",
+                "errors": {
+                    "messages": ["<img src=x onerror=alert(1)>"],
+                },
+            },
+        }
+
+        result = health_monitor.generate_html_report(report)
+
+        self.assertNotIn("<script>alert(1)</script>", result)
+        self.assertNotIn("<img src=x onerror=alert(1)>", result)
+        self.assertIn("&lt;script&gt;", result)
+        self.assertIn("&lt;img", result)
+
+
 if __name__ == "__main__":
     unittest.main()
 

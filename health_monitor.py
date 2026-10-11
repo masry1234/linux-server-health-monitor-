@@ -773,6 +773,61 @@ def print_report(report):
     print("\n" + "=" * 52)
 
 
+
+def generate_html_report(report):
+    """Generate a standalone HTML health report."""
+    import html
+
+    diagnostics = report.get("system_diagnostics") or {}
+    health = report.get("health") or {}
+    system = report.get("system") or {}
+
+    resource_status = html.escape(str(health.get("status", "unknown")))
+    systemd_status = html.escape(
+        str(diagnostics.get("systemd_status", "unknown"))
+    )
+    generated = html.escape(str(report.get("timestamp_utc", "unknown")))
+    hostname = html.escape(str(system.get("hostname", "unknown")))
+    data = html.escape(json.dumps(report, indent=2, ensure_ascii=False))
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux Server Health Report</title>
+<style>
+:root {{
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  background: #0b1325;
+  color: #e8edf7;
+}}
+body {{ max-width: 1100px; margin: 0 auto; padding: 2rem; }}
+header, section {{ background: #131f35; border: 1px solid #2b3b56;
+  border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }}
+h1, h2 {{ margin-top: 0; }}
+.status {{ font-size: 1.1rem; font-weight: 700; }}
+small {{ color: #aab8ce; }}
+pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Linux Server Health Report</h1>
+  <p>Hostname: {hostname}</p>
+  <p class="status">Resource health: {resource_status}</p>
+  <p class="status">Systemd status: {systemd_status}</p>
+  <small>Generated: {generated}</small>
+</header>
+<section>
+  <h2>Full diagnostic report</h2>
+  <pre>{data}</pre>
+</section>
+</body>
+</html>
+"""
+
 def main():
     parser = argparse.ArgumentParser(
         description="Linux Server Health Monitor"
@@ -785,6 +840,10 @@ def main():
     parser.add_argument(
         "--output",
         help="Save report to a JSON file",
+    )
+    parser.add_argument(
+        "--html",
+        help="Save report as an HTML file",
     )
 
     args = parser.parse_args()
@@ -799,6 +858,17 @@ def main():
     except Exception:
         logger.exception("Unexpected error while generating health report")
         raise
+
+    if args.html:
+        try:
+            Path(args.html).write_text(
+                generate_html_report(report),
+                encoding="utf-8",
+            )
+            logger.info("HTML report saved to %s", args.html)
+        except OSError:
+            logger.exception("Failed to save HTML report")
+            raise
 
     if args.output:
         try:
