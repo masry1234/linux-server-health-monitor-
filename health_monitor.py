@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import argparse
@@ -8,7 +7,7 @@ import platform
 import socket
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 VERSION = "0.3.0"
@@ -479,7 +478,7 @@ def collect_report():
     report = {
         "schema_version": "1.0",
         "monitor_version": VERSION,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
         "system": {
             "hostname": socket.gethostname(),
             "os": get_os_info(),
