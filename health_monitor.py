@@ -1,6 +1,7 @@
 
 import argparse
 import json
+import math
 import os
 import platform
 import socket
@@ -9,10 +10,14 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-VERSION = "0.3.0"
-WARNING_THRESHOLD = 80.0
-CRITICAL_THRESHOLD = 95.0
+VERSION = "0.4.0"
 MAX_LOG_MESSAGES = 20
+
+DEFAULT_THRESHOLDS = {
+    "cpu": {"warning": 80.0, "critical": 95.0},
+    "memory": {"warning": 80.0, "critical": 95.0},
+    "disk": {"warning": 80.0, "critical": 95.0},
+}
 
 
 def run_command(command, timeout=8):
@@ -30,6 +35,79 @@ def run_command(command, timeout=8):
         pass
 
     return None
+
+
+def load_thresholds(config_path=None):
+    """Load and validate resource thresholds from JSON configuration."""
+    config_file = (
+        Path(config_path)
+        if config_path is not None
+        else Path(__file__).with_name("config.json")
+    )
+
+    thresholds = {
+        resource: values.copy()
+        for resource, values in DEFAULT_THRESHOLDS.items()
+    }
+
+    if not config_file.exists():
+        return thresholds
+
+    try:
+        with config_file.open(encoding="utf-8") as file:
+            config = json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Cannot read configuration file {config_file}: {error}"
+        ) from error
+
+    if not isinstance(config, dict):
+        raise TypeError("Configuration must be a JSON object.")
+
+    configured_thresholds = config.get("thresholds")
+
+    if not isinstance(configured_thresholds, dict):
+        raise TypeError(
+            "Configuration must contain a 'thresholds' object."
+        )
+
+    for resource in DEFAULT_THRESHOLDS:
+        values = configured_thresholds.get(resource)
+
+        if not isinstance(values, dict):
+            raise TypeError(
+                f"Missing or invalid thresholds for '{resource}'."
+            )
+
+        warning = values.get("warning")
+        critical = values.get("critical")
+
+        for name, value in (
+            ("warning", warning),
+            ("critical", critical),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 <= value <= 100
+            ):
+                raise ValueError(
+                    f"{resource}.{name} must be a finite number "
+                    "from 0 to 100."
+                )
+
+        if warning >= critical:
+            raise ValueError(
+                f"{resource}: warning must be lower than critical."
+            )
+
+        thresholds[resource] = {
+            "warning": float(warning),
+            "critical": float(critical),
+        }
+
+    return thresholds
 
 
 def get_cpu_times():
@@ -107,7 +185,8 @@ def get_memory():
         swap_used = max(0, swap_total - swap_free)
         swap_usage = (
             round(100 * swap_used / swap_total, 1)
-            if swap_total else 0.0
+            if swap_total
+            else 0.0
         )
 
     return {
@@ -181,12 +260,16 @@ def get_network():
             "state": item.get("operstate", "UNKNOWN"),
             "mac_address": item.get("address"),
             "ipv4": [
-                a["local"] for a in addresses
-                if a.get("family") == "inet" and "local" in a
+                address["local"]
+                for address in addresses
+                if address.get("family") == "inet"
+                and "local" in address
             ],
             "ipv6": [
-                a["local"] for a in addresses
-                if a.get("family") == "inet6" and "local" in a
+                address["local"]
+                for address in addresses
+                if address.get("family") == "inet6"
+                and "local" in address
             ],
         })
 
@@ -330,8 +413,6 @@ def get_load_average():
 
 def get_system_diagnostics():
     """Collect systemd state, failed units, and bounded journal samples."""
-
-    
     try:
         result = subprocess.run(
             ["systemctl", "is-system-running"],
@@ -342,8 +423,7 @@ def get_system_diagnostics():
         )
 
         systemd_state = (
-            result.stdout.strip()
-            or result.stderr.strip()
+            result.stdout.strip() or result.stderr.strip()
         ).lower()
 
         valid_states = {
@@ -361,7 +441,6 @@ def get_system_diagnostics():
 
     except (OSError, subprocess.TimeoutExpired):
         systemd_status = "unavailable"
-
 
     failed_output = run_command([
         "systemctl", "--failed",
@@ -428,15 +507,18 @@ def get_system_diagnostics():
     }
 
 
-def assess_health(report):
+def assess_health(report, thresholds=None):
     checks = []
+    thresholds = thresholds or DEFAULT_THRESHOLDS
 
-    def add_check(name, value):
+    def add_check(name, value, resource):
+        limits = thresholds[resource]
+
         if value is None:
             status = "UNKNOWN"
-        elif value >= CRITICAL_THRESHOLD:
+        elif value >= limits["critical"]:
             status = "CRITICAL"
-        elif value >= WARNING_THRESHOLD:
+        elif value >= limits["warning"]:
             status = "WARNING"
         else:
             status = "OK"
@@ -445,15 +527,22 @@ def assess_health(report):
             "name": name,
             "status": status,
             "value": value,
+            "warning_threshold": limits["warning"],
+            "critical_threshold": limits["critical"],
         })
 
-    add_check("cpu", report["cpu"]["usage_percent"])
-    add_check("memory", report["memory"].get("usage_percent"))
+    add_check("cpu", report["cpu"]["usage_percent"], "cpu")
+    add_check(
+        "memory",
+        report["memory"].get("usage_percent"),
+        "memory",
+    )
 
     for disk in report["disks"]:
         add_check(
             f"disk:{disk['mountpoint']}",
             disk["usage_percent"],
+            "disk",
         )
 
     statuses = [item["status"] for item in checks]
@@ -474,6 +563,8 @@ def assess_health(report):
 
 
 def collect_report():
+    thresholds = load_thresholds()
+
     report = {
         "schema_version": "1.0",
         "monitor_version": VERSION,
@@ -497,7 +588,9 @@ def collect_report():
         "system_diagnostics": get_system_diagnostics(),
     }
 
-    report["health"] = assess_health(report)
+    report["thresholds"] = thresholds
+    report["health"] = assess_health(report, thresholds)
+
     return report
 
 
@@ -526,7 +619,16 @@ def print_report(report):
     for check in report["health"]["checks"]:
         print(
             f"{check['name']:<24} {check['status']:<8} "
-            f"value={check['value']}"
+            f"value={check['value']} "
+            f"(warning={check['warning_threshold']}%, "
+            f"critical={check['critical_threshold']}%)"
+        )
+
+    print("\nCONFIGURED THRESHOLDS")
+    for resource, limits in report["thresholds"].items():
+        print(
+            f"{resource:<10} warning={limits['warning']}% "
+            f"critical={limits['critical']}%"
         )
 
     print("\nSYSTEM DIAGNOSTICS")
@@ -617,7 +719,8 @@ def main():
         description="Linux Server Health Monitor"
     )
     parser.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="Print report as JSON",
     )
     parser.add_argument(
@@ -626,7 +729,11 @@ def main():
     )
 
     args = parser.parse_args()
-    report = collect_report()
+
+    try:
+        report = collect_report()
+    except (ValueError, TypeError) as error:
+        parser.error(str(error))
 
     if args.output:
         Path(args.output).write_text(
