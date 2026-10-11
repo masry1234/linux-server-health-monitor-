@@ -1,0 +1,32 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Generated reports
+report.json
+report-*.json
+*.log
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+
