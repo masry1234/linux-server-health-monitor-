@@ -236,7 +236,7 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("Resource health: OK", result)
         self.assertIn("Systemd status: degraded", result)
         self.assertIn("test-server", result)
-        self.assertIn("Full diagnostic report", result)
+        self.assertIn("View complete JSON report", result)
 
     def test_html_report_escapes_untrusted_content(self):
         report = {
@@ -257,6 +257,51 @@ class HtmlReportTests(unittest.TestCase):
         self.assertNotIn("<img src=x onerror=alert(1)>", result)
         self.assertIn("&lt;script&gt;", result)
         self.assertIn("&lt;img", result)
+
+
+    def test_dashboard_shows_failed_units(self):
+        report = {
+            "monitor_version": "0.5.0",
+            "timestamp_utc": "2026-10-11T10:00:00Z",
+            "system": {"hostname": "test-server"},
+            "cpu": {"usage_percent": 42},
+            "memory": {"usage_percent": 50},
+            "disks": [
+                {"mountpoint": "/", "usage_percent": 40, "type": "ext4"}
+            ],
+            "health": {
+                "status": "OK",
+                "checks": [
+                    {
+                        "name": "cpu",
+                        "status": "OK",
+                        "value": 42,
+                        "warning_threshold": 70,
+                        "critical_threshold": 90,
+                    }
+                ],
+            },
+            "system_diagnostics": {
+                "systemd_status": "degraded",
+                "failed_units": [
+                    {
+                        "unit": "demo.service",
+                        "active": "failed",
+                        "description": "Demo failure",
+                    }
+                ],
+                "errors": {"status": "ok", "messages": ["Example error"]},
+                "warnings": {"status": "ok", "messages": ["Example warning"]},
+            },
+        }
+
+        result = health_monitor.generate_html_report(report)
+
+        self.assertIn("Server Health Dashboard", result)
+        self.assertIn("demo.service", result)
+        self.assertIn("Demo failure", result)
+        self.assertIn("Example error", result)
+        self.assertIn("Example warning", result)
 
 
 if __name__ == "__main__":

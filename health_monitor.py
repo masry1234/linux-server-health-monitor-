@@ -775,58 +775,199 @@ def print_report(report):
 
 
 def generate_html_report(report):
-    """Generate a standalone HTML health report."""
+    """Generate a responsive HTML dashboard from a health report."""
     import html
 
-    diagnostics = report.get("system_diagnostics") or {}
-    health = report.get("health") or {}
-    system = report.get("system") or {}
+    def esc(value):
+        return html.escape(str(value if value is not None else "unknown"))
 
-    resource_status = html.escape(str(health.get("status", "unknown")))
-    systemd_status = html.escape(
-        str(diagnostics.get("systemd_status", "unknown"))
-    )
-    generated = html.escape(str(report.get("timestamp_utc", "unknown")))
-    hostname = html.escape(str(system.get("hostname", "unknown")))
-    data = html.escape(json.dumps(report, indent=2, ensure_ascii=False))
+    def status_class(value):
+        normalized = str(value).lower()
+        if normalized in {"ok", "healthy", "active"}:
+            return "good"
+        if normalized in {"warning", "degraded"}:
+            return "warning"
+        if normalized in {"critical", "failed", "error"}:
+            return "critical"
+        return "neutral"
+
+    health = report.get("health") or {}
+    diagnostics = report.get("system_diagnostics") or {}
+    system = report.get("system") or {}
+    disks = report.get("disks") or []
+
+    resource_status = health.get("status", "unknown")
+    systemd_status = diagnostics.get("systemd_status", "unknown")
+    hostname = system.get("hostname", "unknown")
+    generated = report.get("timestamp_utc", "unknown")
+    checks = health.get("checks") or []
+
+    cards = []
+    for check in checks:
+        name = str(check.get("name", "Resource"))
+        value = check.get("value", "unknown")
+        warning = check.get("warning_threshold", "n/a")
+        critical = check.get("critical_threshold", "n/a")
+        status = check.get("status", "unknown")
+        unit = "%" if name in {"cpu", "memory"} or name.startswith("disk:") else ""
+        cards.append(
+            '<article class="metric card">'
+            f'<div class="metric-name">{esc(name)}</div>'
+            f'<div class="metric-value">{esc(value)}{unit}</div>'
+            f'<span class="badge {status_class(status)}">{esc(status)}</span>'
+            f'<p class="muted">Warning: {esc(warning)}{unit} · '
+            f'Critical: {esc(critical)}{unit}</p>'
+            '</article>'
+        )
+
+    if not cards:
+        cards.append('<article class="card">No resource checks available.</article>')
+
+    disk_rows = []
+    for disk in disks:
+        disk_rows.append(
+            "<tr>"
+            f"<td>{esc(disk.get('mountpoint'))}</td>"
+            f"<td>{esc(disk.get('usage_percent'))}%</td>"
+            f"<td>{esc(disk.get('type'))}</td>"
+            "</tr>"
+        )
+    if not disk_rows:
+        disk_rows.append('<tr><td colspan="3">No disk information available.</td></tr>')
+
+    failed_units = diagnostics.get("failed_units") or []
+    unit_rows = []
+    for unit in failed_units:
+        unit_rows.append(
+            "<tr>"
+            f"<td>{esc(unit.get('unit'))}</td>"
+            f"<td>{esc(unit.get('active'))}</td>"
+            f"<td>{esc(unit.get('description'))}</td>"
+            "</tr>"
+        )
+    if not unit_rows:
+        unit_rows.append('<tr><td colspan="3">No failed units reported.</td></tr>')
+
+    def log_list(section):
+        info = diagnostics.get(section) or {}
+        messages = info.get("messages") or []
+        if info.get("status") != "ok":
+            return "<li>Log information unavailable.</li>"
+        if not messages:
+            return "<li>No messages reported.</li>"
+        return "".join(f"<li>{esc(message)}</li>" for message in messages)
+
+    raw_json = esc(json.dumps(report, indent=2, ensure_ascii=False))
 
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Linux Server Health Report</title>
+<title>Linux Server Health Dashboard</title>
 <style>
 :root {{
   color-scheme: dark;
-  font-family: system-ui, sans-serif;
-  background: #0b1325;
-  color: #e8edf7;
+  font-family: Inter, system-ui, sans-serif;
+  background: #09111f;
+  color: #e7edf7;
 }}
-body {{ max-width: 1100px; margin: 0 auto; padding: 2rem; }}
-header, section {{ background: #131f35; border: 1px solid #2b3b56;
-  border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }}
-h1, h2 {{ margin-top: 0; }}
-.status {{ font-size: 1.1rem; font-weight: 700; }}
-small {{ color: #aab8ce; }}
-pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; }}
+main {{ max-width: 1200px; margin: auto; padding: 28px 20px 48px; }}
+header {{ padding: 26px; border: 1px solid #263750; border-radius: 18px;
+  background: linear-gradient(135deg, #14233a, #101a2b); margin-bottom: 22px; }}
+h1 {{ margin: 0 0 8px; font-size: clamp(1.6rem, 4vw, 2.3rem); }}
+h2 {{ font-size: 1.15rem; margin: 0 0 16px; }}
+p {{ line-height: 1.5; }}
+.muted {{ color: #9aabc3; font-size: .88rem; }}
+.overview {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }}
+.badge {{ display: inline-block; border-radius: 999px; padding: 5px 10px;
+  font-size: .8rem; font-weight: 700; }}
+.good {{ background: #123b31; color: #7de0b5; }}
+.warning {{ background: #49351a; color: #ffd18a; }}
+.critical {{ background: #4b2028; color: #ff9aa6; }}
+.neutral {{ background: #29364a; color: #c4d0e2; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px; margin-bottom: 22px; }}
+.card, section {{ background: #111d30; border: 1px solid #263750;
+  border-radius: 14px; padding: 18px; min-width: 0; }}
+.metric-name {{ color: #a9b9d0; font-size: .9rem; overflow-wrap: anywhere; }}
+.metric-value {{ font-size: 1.9rem; font-weight: 750; margin: 10px 0; }}
+section {{ margin-bottom: 18px; }}
+.table-wrap {{ overflow-x: auto; }}
+table {{ width: 100%; border-collapse: collapse; text-align: left; }}
+th, td {{ padding: 11px 12px; border-bottom: 1px solid #263750;
+  vertical-align: top; overflow-wrap: anywhere; }}
+th {{ color: #a9b9d0; font-size: .85rem; }}
+ul {{ padding-left: 20px; }}
+li {{ margin: 8px 0; overflow-wrap: anywhere; }}
+details summary {{ cursor: pointer; font-weight: 650; }}
+pre {{ white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; }}
+footer {{ color: #8293ac; text-align: center; padding-top: 14px; font-size: .85rem; }}
 </style>
 </head>
 <body>
+<main>
 <header>
-  <h1>Linux Server Health Report</h1>
-  <p>Hostname: {hostname}</p>
-  <p class="status">Resource health: {resource_status}</p>
-  <p class="status">Systemd status: {systemd_status}</p>
-  <small>Generated: {generated}</small>
+  <p class="muted">LINUX SERVER HEALTH MONITOR · VERSION {esc(report.get("monitor_version", "unknown"))}</p>
+  <h1>Server Health Dashboard</h1>
+  <p>Host: <strong>{esc(hostname)}</strong></p>
+  <div class="overview">
+    <span class="badge {status_class(resource_status)}">Resource health: {esc(resource_status)}</span>
+    <span class="badge {status_class(systemd_status)}">Systemd status: {esc(systemd_status)}</span>
+  </div>
+  <p class="muted">Generated: {esc(generated)}</p>
 </header>
+
 <section>
-  <h2>Full diagnostic report</h2>
-  <pre>{data}</pre>
+  <h2>Resource health checks</h2>
+  <div class="grid">{''.join(cards)}</div>
 </section>
+
+<section>
+  <h2>Disk usage</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Mount point</th><th>Used</th><th>Filesystem</th></tr></thead>
+    <tbody>{''.join(disk_rows)}</tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>Failed systemd units</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Unit</th><th>State</th><th>Description</th></tr></thead>
+    <tbody>{''.join(unit_rows)}</tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>Recent errors</h2>
+  <ul>{log_list("errors")}</ul>
+</section>
+
+<section>
+  <h2>Recent warnings</h2>
+  <ul>{log_list("warnings")}</ul>
+</section>
+
+<section>
+  <details>
+    <summary>View complete JSON report</summary>
+    <pre>{raw_json}</pre>
+  </details>
+</section>
+
+<footer>Generated locally by Linux Server Health Monitor.</footer>
+</main>
 </body>
 </html>
 """
+
 
 def main():
     parser = argparse.ArgumentParser(
