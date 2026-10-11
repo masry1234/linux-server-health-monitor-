@@ -1,5 +1,6 @@
 
 import json
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,7 +90,6 @@ class SystemDiagnosticsTests(unittest.TestCase):
         self.assertEqual(checks["cpu"]["status"], "OK")
         self.assertEqual(checks["memory"]["status"], "WARNING")
         self.assertEqual(checks["disk:/"]["status"], "WARNING")
-
         self.assertEqual(checks["memory"]["warning_threshold"], 75.0)
         self.assertEqual(checks["disk:/"]["warning_threshold"], 80.0)
 
@@ -133,6 +133,72 @@ class SystemDiagnosticsTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 health_monitor.load_thresholds(config_path)
+
+
+class LoggingTests(unittest.TestCase):
+    def setUp(self):
+        self.logger = logging.getLogger("health_monitor")
+        self.original_handlers = self.logger.handlers[:]
+        self.original_level = self.logger.level
+        self.original_propagate = self.logger.propagate
+
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
+            handler.close()
+
+        self.temp_directory = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self.temp_directory.name)
+        self.log_file = self.log_dir / "health_monitor.log"
+
+    def tearDown(self):
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
+            handler.close()
+
+        for handler in self.original_handlers:
+            self.logger.addHandler(handler)
+
+        self.logger.setLevel(self.original_level)
+        self.logger.propagate = self.original_propagate
+        self.temp_directory.cleanup()
+
+    def test_setup_logging_writes_to_file(self):
+        with (
+            patch.object(health_monitor, "LOG_DIR", self.log_dir),
+            patch.object(health_monitor, "LOG_FILE", self.log_file),
+        ):
+            logger = health_monitor.setup_logging()
+            logger.info("logging test message")
+
+            for handler in logger.handlers:
+                handler.flush()
+
+            self.assertTrue(self.log_file.exists())
+
+            log_content = self.log_file.read_text(encoding="utf-8")
+            self.assertIn("INFO", log_content)
+            self.assertIn("logging test message", log_content)
+
+    def test_logging_rotates_old_files(self):
+        with (
+            patch.object(health_monitor, "LOG_DIR", self.log_dir),
+            patch.object(health_monitor, "LOG_FILE", self.log_file),
+            patch.object(health_monitor, "LOG_MAX_BYTES", 200),
+            patch.object(health_monitor, "LOG_BACKUP_COUNT", 2),
+        ):
+            logger = health_monitor.setup_logging()
+
+            for index in range(30):
+                logger.info("Test log entry %03d: %s", index, "X" * 40)
+
+            for handler in logger.handlers:
+                handler.flush()
+
+            rotated_file = Path(f"{self.log_file}.1")
+            self.assertTrue(
+                rotated_file.exists(),
+                "Expected a rotated log file to be created.",
+            )
 
 
 if __name__ == "__main__":
