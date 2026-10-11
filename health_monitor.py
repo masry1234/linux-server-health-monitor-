@@ -1,6 +1,7 @@
 
 import argparse
 import json
+import logging
 import math
 import os
 import platform
@@ -8,16 +9,50 @@ import socket
 import subprocess
 import time
 from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MAX_LOG_MESSAGES = 20
+
+LOG_DIR = Path(__file__).with_name("logs")
+LOG_FILE = LOG_DIR / "health_monitor.log"
+LOG_MAX_BYTES = 1_048_576
+LOG_BACKUP_COUNT = 5
 
 DEFAULT_THRESHOLDS = {
     "cpu": {"warning": 80.0, "critical": 95.0},
     "memory": {"warning": 80.0, "critical": 95.0},
     "disk": {"warning": 80.0, "critical": 95.0},
 }
+
+
+def setup_logging():
+    """Configure rotating file logging."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("health_monitor")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if logger.handlers:
+        return logger
+
+    handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+        )
+    )
+
+    logger.addHandler(handler)
+    return logger
 
 
 def run_command(command, timeout=8):
@@ -562,8 +597,15 @@ def assess_health(report, thresholds=None):
     }
 
 
-def collect_report():
-    thresholds = load_thresholds()
+def collect_report(logger=None):
+    logger = logger or logging.getLogger("health_monitor")
+    logger.info("Starting health report collection")
+
+    try:
+        thresholds = load_thresholds()
+    except (ValueError, TypeError) as error:
+        logger.error("Configuration validation failed: %s", error)
+        raise
 
     report = {
         "schema_version": "1.0",
@@ -591,6 +633,15 @@ def collect_report():
     report["thresholds"] = thresholds
     report["health"] = assess_health(report, thresholds)
 
+    health_status = report["health"]["status"]
+    if health_status == "CRITICAL":
+        logger.critical("Health assessment status: %s", health_status)
+    elif health_status == "WARNING" or health_status == "UNKNOWN":
+        logger.warning("Health assessment status: %s", health_status)
+    else:
+        logger.info("Health assessment status: %s", health_status)
+
+    logger.info("Health report collection completed")
     return report
 
 
@@ -729,17 +780,28 @@ def main():
     )
 
     args = parser.parse_args()
+    logger = setup_logging()
+    logger.info("Linux Server Health Monitor v%s started", VERSION)
 
     try:
-        report = collect_report()
+        report = collect_report(logger)
     except (ValueError, TypeError) as error:
+        logger.error("Unable to generate health report: %s", error)
         parser.error(str(error))
+    except Exception:
+        logger.exception("Unexpected error while generating health report")
+        raise
 
     if args.output:
-        Path(args.output).write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            Path(args.output).write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            logger.info("JSON report saved to %s", args.output)
+        except OSError:
+            logger.exception("Failed to save JSON report")
+            raise
 
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -748,6 +810,8 @@ def main():
 
         if args.output:
             print(f"\nJSON saved to: {args.output}")
+
+    logger.info("Linux Server Health Monitor finished")
 
 
 if __name__ == "__main__":
