@@ -1,139 +1,139 @@
 # Linux Server Health Monitor
 
-A Python-based Linux system health monitoring tool that collects
-system resource metrics, checks resource health, and generates
-readable reports for troubleshooting and system administration.
+A Python-based Linux system monitoring and diagnostics tool that collects system metrics, evaluates resource health, inspects system services, and generates JSON and HTML reports.
 
-## Overview
-
-Linux Server Health Monitor helps administrators inspect the
-current state of a Linux environment from a single command.
-
-The tool is currently tested in Ubuntu running under WSL2.
-Some system diagnostics may behave differently in WSL2 than
-on a native Linux server.
+Designed for Linux troubleshooting, system administration, and infrastructure monitoring practice.
 
 ## Features
 
-- CPU usage and logical CPU core count
-- RAM and swap utilization
-- Disk usage for mounted filesystems
-- System load average and uptime
-- Network interface status and IP addresses
-- Listening TCP and UDP sockets
-- Configurable service availability checks
-- Top processes by CPU usage
-- Systemd status and failed-unit diagnostics when available
-- Recent system error and warning logs when available
-- Resource health checks and overall health status
-- JSON report generation
-- Automated unit tests
+- **System Resources:** CPU usage, logical CPU count, RAM, swap, disk utilization, load average, and uptime.
+- **Network Diagnostics:** Network interfaces, IP addresses, and listening TCP/UDP sockets.
+- **Process Monitoring:** Identifies top processes by CPU usage.
+- **Service Diagnostics:** Checks configured services, systemd state, and failed units when available.
+- **Log Diagnostics:** Collects recent system errors and warnings when supported by the environment.
+- **Health Checks:** Evaluates resource usage against configurable thresholds.
+- **JSON Reports:** Prints JSON output or saves it to a file.
+- **HTML Dashboard:** Generates a standalone HTML report for readable system-health summaries.
+- **Logging:** Supports rotating log files with a fallback to standard error.
+- **Automated Tests:** Unit tests for monitoring, diagnostics, reporting, and logging.
+- **Code Quality:** Ruff linting and GitHub Actions continuous integration.
 
 ## Requirements
 
 - Python 3
-- Linux environment or WSL2 with Ubuntu
+- Linux, or Ubuntu under WSL2
 - Git
-- jq for inspecting JSON reports from the terminal
+- `jq` (optional, for inspecting JSON reports)
+- `systemd` and other Linux utilities for certain diagnostic features
 
-Some diagnostic features depend on the available Linux
-utilities and permissions.
+Some features depend on available system utilities, permissions, and the host environment.
 
 ## Installation
 
 Clone the repository:
 
-```
-git clone https://github.com/masry1234/linux-server-health-monitor.git
-cd linux-server-health-monitor
+```bash
+git clone https://github.com/masry1234/linux-server-health-monitor-.git
+cd linux-server-health-monitor-
 ```
 
 Create and activate a virtual environment:
 
-```
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install dependencies if required by the project.
+No additional Python package installation is required unless the project dependencies change.
 
 ## Usage
 
-Run the health monitor:
+Run the monitor and display the report:
 
-```
+```bash
 python health_monitor.py
 ```
 
-Generate a JSON report:
+Print the report as JSON:
 
+```bash
+python health_monitor.py --json
 ```
+
+Save a JSON report:
+
+```bash
 python health_monitor.py --output report.json
 ```
 
-Inspect the overall health status:
+Generate an HTML dashboard:
 
+```bash
+python health_monitor.py --html report.html
 ```
+
+Generate both JSON and HTML reports:
+
+```bash
+python health_monitor.py --output report.json --html report.html
+```
+
+Display available command-line options:
+
+```bash
+python health_monitor.py --help
+```
+
+### Inspect JSON Reports
+
+If `jq` is installed, inspect selected report sections:
+
+```bash
 jq '.health' report.json
-```
-
-Inspect listening sockets:
-
-```
 jq '.listening_sockets' report.json
-```
-
-Inspect system diagnostic errors:
-
-```
 jq '.system_diagnostics.errors' report.json
 ```
 
 ## Testing
 
-Run the unit tests:
+Run the automated unit tests:
 
-```
+```bash
 python -m unittest -v test_health_monitor.py
 ```
 
-## Example Output
+Run Ruff lint checks if installed:
 
-The report includes system information, resource utilization,
-health-check results, disk usage, network information,
-listening sockets, service status, and top processes.
+```bash
+python -m ruff check .
+```
 
-The exact output depends on the host operating system,
-available permissions, and installed system utilities.
+Check the latest workflow results in the repository's **Actions** tab on GitHub.
 
-## Platform Notes
+## Platform Compatibility
 
-This project is currently developed and tested in Ubuntu
-under Windows Subsystem for Linux 2 (WSL2).
+The project is currently developed and tested in Ubuntu under Windows Subsystem for Linux 2 (WSL2).
 
-WSL2 may not expose all hardware information or systemd
-features available on a native Linux server. Some kernel
-messages and service checks may therefore reflect WSL2
-limitations rather than actual server faults.
+WSL2 does not expose every hardware metric, kernel interface, or systemd feature available on a native Linux server. Some diagnostics may therefore be unavailable or reflect WSL2 limitations rather than actual server faults.
+
+For production Linux environments, validate the results against the target distribution, available permissions, and installed system utilities.
 
 ## Security Considerations
 
 - Run with the minimum privileges required.
-- Review diagnostic logs before sharing reports publicly.
-- Do not commit credentials, tokens, or sensitive system data.
-- Avoid running commands that modify the host system unless
-  explicitly intended and reviewed.
+- Review reports and logs before sharing them publicly.
+- Do not commit credentials, access tokens, or sensitive infrastructure data.
+- Treat process details, IP addresses, listening sockets, and system logs as potentially sensitive information.
+- Review any commands before running them with elevated privileges.
 
 ## Roadmap
 
-- [ ] Improve compatibility with native Linux servers
-- [ ] Add configurable CPU, RAM, and disk alert thresholds
-- [ ] Add structured logging and clearer error handling
-- [ ] Improve socket-to-process identification
-- [ ] Add continuous integration with GitHub Actions
-- [ ] Expand automated test coverage
+- [ ] Validate compatibility across additional Linux distributions.
+- [ ] Add optional alert delivery through email or other notification channels.
+- [ ] Improve integration testing on native Linux systems.
+- [ ] Add historical metric storage and trend analysis.
+- [ ] Document deployment and scheduling options for periodic monitoring.
 
 ## License
 
-License information will be added when a project license
-has been selected.
+No license has been selected yet. All rights reserved by default until a license is added to the repository.
