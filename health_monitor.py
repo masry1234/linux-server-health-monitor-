@@ -1,4 +1,3 @@
-
 import argparse
 import json
 import logging
@@ -607,6 +606,88 @@ def assess_health(report, thresholds=None):
         "checks": checks,
     }
 
+HISTORY_FILE = Path(__file__).with_name("health_history.jsonl")
+
+
+def save_report_history(report, logger=None):
+    """Append one health report to the local JSONL history."""
+    logger = logger or logging.getLogger("health_monitor")
+
+    try:
+        with HISTORY_FILE.open("a", encoding="utf-8") as file:
+            file.write(
+                json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+    except OSError:
+        logger.exception("Failed to save health report history")
+
+def show_history(limit=10):
+    """Display the most recent health checks from local JSONL history."""
+    if not HISTORY_FILE.exists():
+        print("No health history found yet.")
+        return
+
+    reports = []
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                try:
+                    reports.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as error:
+        print(f"Unable to read health history: {error}", file=sys.stderr)
+        return
+
+    if not reports:
+        print("No valid health history records found.")
+        return
+
+    print(f"\nLatest {min(limit, len(reports))} health checks")
+    print("-" * 90)
+    print(f"{'Timestamp (UTC)':<33} {'Status':<10} {'CPU %':>8} {'RAM %':>8} {'Disks':>8}")
+    print("-" * 90)
+
+    for report in reports[-limit:][::-1]:
+        timestamp = report.get("timestamp_utc", "unknown")
+        status = report.get("health", {}).get("status", "UNKNOWN")
+        cpu = report.get("cpu", {}).get("usage_percent")
+        memory = report.get("memory", {}).get("usage_percent")
+        disks = report.get("disks", [])
+
+        cpu_text = f"{cpu:.1f}" if isinstance(cpu, (int, float)) else "N/A"
+        memory_text = (
+            f"{memory:.1f}" if isinstance(memory, (int, float)) else "N/A"
+        )
+
+        print(
+            f"{timestamp:<33} {status:<10} "
+            f"{cpu_text:>8} {memory_text:>8} {len(disks):>8}"
+        )
+
+def load_report_history(limit=10):
+    """Load the most recent valid reports from local JSONL history."""
+    if limit < 1 or not HISTORY_FILE.exists():
+        return []
+
+    reports = []
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                try:
+                    reports.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+
+    return reports[-limit:]
+
 
 def collect_report(logger=None):
     logger = logger or logging.getLogger("health_monitor")
@@ -777,7 +858,7 @@ def print_report(report):
 
 
 
-def generate_html_report(report):
+def generate_html_report(report, history=None):
     """Generate a responsive HTML dashboard from a health report."""
     import html
 
@@ -813,10 +894,22 @@ def generate_html_report(report):
         critical = check.get("critical_threshold", "n/a")
         status = check.get("status", "unknown")
         unit = "%" if name in {"cpu", "memory"} or name.startswith("disk:") else ""
+
+        try:
+            progress = max(0.0, min(100.0, float(value)))
+            progress_width = f"{progress:.1f}"
+        except (TypeError, ValueError):
+            progress_width = "0"
+
         cards.append(
             '<article class="metric card">'
             f'<div class="metric-name">{esc(name)}</div>'
             f'<div class="metric-value">{esc(value)}{unit}</div>'
+            f'<div class="progress-track" role="progressbar" '
+            f'aria-label="{esc(name)} usage" aria-valuemin="0" '
+            f'aria-valuemax="100" aria-valuenow="{progress_width}">'
+            f'<div class="progress-fill {status_class(status)}" '
+            f'style="width: {progress_width}%"></div></div>'
             f'<span class="badge {status_class(status)}">{esc(status)}</span>'
             f'<p class="muted">Warning: {esc(warning)}{unit} · '
             f'Critical: {esc(critical)}{unit}</p>'
@@ -835,9 +928,9 @@ def generate_html_report(report):
             f"<td>{esc(disk.get('type'))}</td>"
             "</tr>"
         )
+
     if not disk_rows:
         disk_rows.append('<tr><td colspan="3">No disk information available.</td></tr>')
-
     failed_units = diagnostics.get("failed_units") or []
     unit_rows = []
     for unit in failed_units:
@@ -860,6 +953,33 @@ def generate_html_report(report):
             return "<li>No messages reported.</li>"
         return "".join(f"<li>{esc(message)}</li>" for message in messages)
 
+    history_rows = []
+    for item in (history or [])[-10:][::-1]:
+        timestamp = item.get("timestamp_utc", "unknown")
+        status = item.get("health", {}).get("status", "UNKNOWN")
+        cpu = item.get("cpu", {}).get("usage_percent")
+        memory = item.get("memory", {}).get("usage_percent")
+
+        cpu_text = f"{cpu:.1f}%" if isinstance(cpu, (int, float)) else "N/A"
+        memory_text = (
+            f"{memory:.1f}%" if isinstance(memory, (int, float)) else "N/A"
+        )
+
+        history_rows.append(
+            "<tr>"
+            f"<td>{esc(timestamp)}</td>"
+            f'<td><span class="badge {status_class(status)}">{esc(status)}</span></td>'
+            f"<td>{esc(cpu_text)}</td>"
+            f"<td>{esc(memory_text)}</td>"
+            "</tr>"
+        )
+
+    if not history_rows:
+        history_rows.append(
+            '<tr><td colspan="4">No health history available.</td></tr>'
+        )
+
+
     raw_json = esc(json.dumps(report, indent=2, ensure_ascii=False))
 
     return f"""<!doctype html>
@@ -871,43 +991,204 @@ def generate_html_report(report):
 <style>
 :root {{
   color-scheme: dark;
-  font-family: Inter, system-ui, sans-serif;
-  background: #09111f;
-  color: #e7edf7;
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  background: #080d18;
+  color: #e8edf7;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --surface: #101827;
+  --surface-raised: #151f31;
+  --border: #26344a;
+  --muted: #91a0b8;
+  --accent: #73a7ff;
 }}
 * {{ box-sizing: border-box; }}
-body {{ margin: 0; }}
-main {{ max-width: 1200px; margin: auto; padding: 28px 20px 48px; }}
-header {{ padding: 26px; border: 1px solid #263750; border-radius: 18px;
-  background: linear-gradient(135deg, #14233a, #101a2b); margin-bottom: 22px; }}
-h1 {{ margin: 0 0 8px; font-size: clamp(1.6rem, 4vw, 2.3rem); }}
-h2 {{ font-size: 1.15rem; margin: 0 0 16px; }}
-p {{ line-height: 1.5; }}
-.muted {{ color: #9aabc3; font-size: .88rem; }}
-.overview {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }}
-.badge {{ display: inline-block; border-radius: 999px; padding: 5px 10px;
-  font-size: .8rem; font-weight: 700; }}
-.good {{ background: #123b31; color: #7de0b5; }}
-.warning {{ background: #49351a; color: #ffd18a; }}
-.critical {{ background: #4b2028; color: #ff9aa6; }}
-.neutral {{ background: #29364a; color: #c4d0e2; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 14px; margin-bottom: 22px; }}
-.card, section {{ background: #111d30; border: 1px solid #263750;
-  border-radius: 14px; padding: 18px; min-width: 0; }}
-.metric-name {{ color: #a9b9d0; font-size: .9rem; overflow-wrap: anywhere; }}
-.metric-value {{ font-size: 1.9rem; font-weight: 750; margin: 10px 0; }}
+body {{
+  margin: 0;
+  background:
+    radial-gradient(ellipse at 12% 0%, #172541 0, transparent 38%),
+    #080d18;
+}}
+main {{ max-width: 1320px; margin: auto; padding: 32px 24px 48px; }}
+header {{
+  position: relative;
+  overflow: hidden;
+  padding: 32px;
+  border: 1px solid #2b3d59;
+  border-radius: 22px;
+  background: linear-gradient(120deg, #17263d, #101827 70%);
+  margin-bottom: 24px;
+  box-shadow: 0 16px 40px #00000020;
+}}
+header::after {{
+  content: "";
+  position: absolute;
+  width: 220px;
+  height: 220px;
+  right: -90px;
+  top: -100px;
+  border-radius: 50%;
+  background: #4d83e8;
+  opacity: .09;
+  filter: blur(8px);
+  pointer-events: none;
+}}
+header > * {{ position: relative; z-index: 1; }}
+header .muted:first-child {{
+  color: #8fb7ff;
+  font-size: .76rem;
+  font-weight: 750;
+  letter-spacing: .13em;
+}}
+h1 {{
+  margin: 10px 0 12px;
+  font-size: clamp(1.8rem, 4vw, 2.65rem);
+  letter-spacing: -.045em;
+  line-height: 1.15;
+}}
+h2 {{
+  font-size: 1rem;
+  letter-spacing: -.015em;
+  margin: 0 0 18px;
+}}
+p {{ line-height: 1.6; }}
+.muted {{ color: var(--muted); font-size: .85rem; }}
+.overview {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0 14px; }}
+.badge {{
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: .76rem;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: .025em;
+}}
+.good {{ background: #10352d; border-color: #1c5847; color: #78e0b7; }}
+.warning {{ background: #3c2d17; border-color: #725322; color: #ffd18a; }}
+.critical {{ background: #401f2a; border-color: #743344; color: #ff9cab; }}
+.neutral {{ background: #202c40; border-color: #35445c; color: #bdc9dc; }}
+.grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 14px;
+  margin-bottom: 8px;
+}}
+.card, section {{
+  background: linear-gradient(145deg, #121d2e, #0f1827);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 22px;
+  min-width: 0;
+  box-shadow: 0 8px 24px #00000012;
+}}
 section {{ margin-bottom: 18px; }}
-.table-wrap {{ overflow-x: auto; }}
+.metric {{
+  position: relative;
+  overflow: hidden;
+  padding: 20px;
+  transition: border-color .18s ease, transform .18s ease;
+}}
+.metric:hover {{
+  border-color: #425a7d;
+  transform: translateY(-2px);
+}}
+.metric-name {{
+  color: #aab9d0;
+  font-size: .82rem;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}}
+.metric-value {{
+  font-size: clamp(1.8rem, 3vw, 2.25rem);
+  font-weight: 780;
+  letter-spacing: -.045em;
+  margin: 12px 0;
+  font-variant-numeric: tabular-nums;
+}}
+.metric .badge {{ margin-bottom: 8px; }}
+.metric p {{ margin: 8px 0 0; }}
+.table-wrap {{ overflow-x: auto; border-radius: 10px; }}
 table {{ width: 100%; border-collapse: collapse; text-align: left; }}
-th, td {{ padding: 11px 12px; border-bottom: 1px solid #263750;
-  vertical-align: top; overflow-wrap: anywhere; }}
-th {{ color: #a9b9d0; font-size: .85rem; }}
+th, td {{
+  padding: 13px 14px;
+  border-bottom: 1px solid #253249;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}}
+th {{
+  color: #91a6c4;
+  font-size: .73rem;
+  font-weight: 750;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  background: #151f30;
+}}
+tbody tr {{ transition: background .15s ease; }}
+tbody tr:hover {{ background: #182438; }}
+tbody tr:last-child td {{ border-bottom: 0; }}
 ul {{ padding-left: 20px; }}
-li {{ margin: 8px 0; overflow-wrap: anywhere; }}
-details summary {{ cursor: pointer; font-weight: 650; }}
-pre {{ white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; }}
-footer {{ color: #8293ac; text-align: center; padding-top: 14px; font-size: .85rem; }}
+li {{
+  margin: 9px 0;
+  padding-left: 3px;
+  color: #c6d0e0;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}}
+li::marker {{ color: #759de0; }}
+details {{
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 15px 17px;
+  background: #0c1422;
+}}
+details summary {{
+  cursor: pointer;
+  font-weight: 700;
+  color: #c8d8f1;
+}}
+details summary:hover {{ color: #8fb7ff; }}
+pre {{
+  max-height: 520px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 16px;
+  border-radius: 10px;
+  background: #080e18;
+  border: 1px solid #26344a;
+  color: #b9cbe5;
+  font-size: .78rem;
+  line-height: 1.6;
+}}
+.progress-track {{
+  height: 7px;
+  margin: 14px 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #26344a;
+}}
+.progress-fill {{
+  height: 100%;
+  border-radius: inherit;
+  transition: width .25s ease;
+}}
+.progress-fill.good {{ background: #42d6a0; }}
+.progress-fill.warning {{ background: #f4b74f; }}
+.progress-fill.critical {{ background: #ff7185; }}
+.progress-fill.neutral {{ background: #7798c9; }}footer {{ color: #71829d; text-align: center; padding-top: 20px; font-size: .8rem; }}
+@media (max-width: 640px) {{
+  main {{ padding: 16px 12px 32px; }}
+  header {{ padding: 23px 19px; border-radius: 16px; }}
+  .card, section {{ padding: 17px; }}
+  .metric {{ padding: 17px; }}
+  th, td {{ padding: 10px; }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+  *, *::before, *::after {{ transition: none !important; }}
+}}
 </style>
 </head>
 <body>
@@ -928,6 +1209,22 @@ footer {{ color: #8293ac; text-align: center; padding-top: 14px; font-size: .85r
   <div class="grid">{''.join(cards)}</div>
 </section>
 
+<<section>
+  <h2>Recent Health History</h2>
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp (UTC)</th>
+        <th>Status</th>
+        <th>CPU</th>
+        <th>RAM</th>
+      </tr>
+    </thead>
+    <tbody>{''.join(history_rows)}</tbody>
+  </table>
+  </div>
+</section>
 <section>
   <h2>Disk usage</h2>
   <div class="table-wrap">
@@ -972,6 +1269,37 @@ footer {{ color: #8293ac; text-align: center; padding-top: 14px; font-size: .85r
 """
 
 
+def watch_health(logger, interval):
+    """Continuously collect and display health reports."""
+    logger.info(
+        "Continuous monitoring started (interval=%s seconds)",
+        interval,
+    )
+
+    try:
+        while True:
+            try:
+                report = collect_report(logger)
+                save_report_history(report, logger)
+                print("\n" + "=" * 60)
+                print(f"Health check: {datetime.now(UTC).isoformat()}")
+                print_report(report)
+            except (ValueError, TypeError) as error:
+                logger.error("Health check failed: %s", error)
+                print(f"Health check failed: {error}", file=sys.stderr)
+            except Exception:
+                logger.exception("Unexpected error during health check")
+                print(
+                    "Health check failed. See the log for details.",
+                    file=sys.stderr,
+                )
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped.")
+        logger.info("Continuous monitoring stopped")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Linux Server Health Monitor"
@@ -989,13 +1317,51 @@ def main():
         "--html",
         help="Save report as an HTML file",
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run continuous health monitoring",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=5,
+        help="Seconds between checks in watch mode (default: 5)",
+    )
+    parser.add_argument(
+        "--history",
+        type=int,
+        nargs="?",
+        const=10,
+        metavar="N",
+        help="Show the latest N health checks (default: 10)",
+    )
 
     args = parser.parse_args()
+    if args.history is not None:
+        if args.history < 1:
+            parser.error("--history must be at least 1")
+        show_history(args.history)
+        return
+
+    if args.interval < 1:
+        parser.error("--interval must be at least 1 second")
+
+    if args.watch and (args.output or args.html or args.json):
+        parser.error(
+            "--watch cannot be combined with --output, --html, or --json yet"
+        )
     logger = setup_logging()
     logger.info("Linux Server Health Monitor v%s started", VERSION)
 
+    if args.watch:
+        watch_health(logger, args.interval)
+        logger.info("Linux Server Health Monitor finished")
+        return
+
     try:
         report = collect_report(logger)
+        save_report_history(report, logger)
     except (ValueError, TypeError) as error:
         logger.error("Unable to generate health report: %s", error)
         parser.error(str(error))
@@ -1006,7 +1372,7 @@ def main():
     if args.html:
         try:
             Path(args.html).write_text(
-                generate_html_report(report),
+                generate_html_report(report, load_report_history(10)),
                 encoding="utf-8",
             )
             logger.info("HTML report saved to %s", args.html)
@@ -1038,4 +1404,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
