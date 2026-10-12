@@ -494,7 +494,6 @@ def get_system_diagnostics():
         failed_units_status = "unavailable"
         failed_units = []
     else:
-        failed_units_status = "ok"
         failed_units = []
 
         for line in failed_output.splitlines():
@@ -509,6 +508,10 @@ def get_system_diagnostics():
                 "sub": fields[3] if len(fields) > 3 else None,
                 "description": fields[4] if len(fields) > 4 else None,
             })
+
+        failed_units_status = (
+            "issues_found" if failed_units else "ok"
+        )
 
     def read_journal(priority):
         output = run_command([

@@ -28,6 +28,54 @@ class SystemDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(result["systemd_status"], "degraded")
 
+    def test_failed_units_status_when_unit_failed(self):
+        mocked_result = unittest.mock.Mock(
+            returncode=1,
+            stdout="degraded\\n",
+            stderr="",
+        )
+
+        with patch(
+            "health_monitor.subprocess.run",
+            return_value=mocked_result,
+        ), patch(
+            "health_monitor.run_command",
+            side_effect=[
+                (
+                    "systemd-binfmt.service loaded failed failed "
+                    "Set Up Additional Binary Formats"
+                ),
+                "",
+                "",
+            ],
+        ):
+            result = health_monitor.get_system_diagnostics()
+
+        self.assertEqual(
+            result["failed_units_status"],
+            "issues_found",
+        )
+        self.assertEqual(len(result["failed_units"]), 1)
+
+    def test_failed_units_status_when_no_units_failed(self):
+        mocked_result = unittest.mock.Mock(
+            returncode=0,
+            stdout="running\\n",
+            stderr="",
+        )
+
+        with patch(
+            "health_monitor.subprocess.run",
+            return_value=mocked_result,
+        ), patch(
+            "health_monitor.run_command",
+            side_effect=["", "", ""],
+        ):
+            result = health_monitor.get_system_diagnostics()
+
+        self.assertEqual(result["failed_units_status"], "ok")
+        self.assertEqual(result["failed_units"], [])
+
     def test_health_thresholds(self):
         thresholds = {
             "cpu": {"warning": 70.0, "critical": 90.0},
