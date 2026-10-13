@@ -350,22 +350,38 @@ def get_listening_sockets():
     }
 
 
-def get_services():
-    names = ("ssh", "sshd", "docker", "nginx")
+def get_services(service_config=None):
+    if service_config is None:
+        service_config = {
+            "ssh": {"enabled": True, "unit": "ssh"},
+            "sshd": {"enabled": True, "unit": "sshd"},
+            "docker": {"enabled": True, "unit": "docker"},
+            "nginx": {"enabled": True, "unit": "nginx"},
+        }
+
     services = {}
+    enabled_services = {
+        name: settings
+        for name, settings in service_config.items()
+        if settings.get("enabled", True)
+    }
+
+    if not enabled_services:
+        return {}
 
     if run_command(["systemctl", "--version"]) is None:
-        return {name: "UNKNOWN" for name in names}
+        return {name: "UNKNOWN" for name in enabled_services}
 
-    for service in names:
+    for name, settings in enabled_services.items():
+        unit = settings.get("unit", name)
         output = run_command([
-            "systemctl", "show", service,
+            "systemctl", "show", unit,
             "--property=LoadState,ActiveState",
             "--no-pager",
         ])
 
         if output is None:
-            services[service] = "UNKNOWN"
+            services[name] = "UNKNOWN"
             continue
 
         properties = dict(
@@ -378,15 +394,16 @@ def get_services():
         active_state = properties.get("ActiveState", "unknown")
 
         if load_state == "not-found":
-            services[service] = "NOT_INSTALLED"
+            services[name] = "NOT_INSTALLED"
         elif active_state == "active":
-            services[service] = "OK"
+            services[name] = "OK"
         elif active_state == "inactive":
-            services[service] = "INACTIVE"
+            services[name] = "INACTIVE"
         else:
-            services[service] = active_state.upper()
+            services[name] = active_state.upper()
 
     return services
+
 
 
 def get_top_processes():
@@ -709,8 +726,18 @@ def collect_report(logger=None):
 
     try:
         thresholds = load_thresholds()
-    except (ValueError, TypeError) as error:
-        logger.error("Configuration validation failed: %s", error)
+        config_path = Path(__file__).with_name("config.json")
+        with config_path.open(encoding="utf-8") as file:
+            config = json.load(file)
+
+        service_config = config.get("services", {
+            "ssh": {"enabled": True, "unit": "ssh"},
+            "sshd": {"enabled": True, "unit": "sshd"},
+            "docker": {"enabled": True, "unit": "docker"},
+            "nginx": {"enabled": True, "unit": "nginx"},
+        })
+    except (ValueError, TypeError, OSError) as error:
+        logger.error("Configuration loading failed: %s", error)
         raise
 
     report = {
@@ -731,7 +758,7 @@ def collect_report(logger=None):
         "disks": get_disks(),
         "network": get_network(),
         "listening_sockets": get_listening_sockets(),
-        "services": get_services(),
+        "services": get_services(service_config),
         "top_processes": get_top_processes(),
         "system_diagnostics": get_system_diagnostics(),
     }

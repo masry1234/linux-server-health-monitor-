@@ -474,3 +474,42 @@ class HistoryTests(unittest.TestCase):
 
         self.assertEqual([report["id"] for report in reports], [2, 3])
 
+
+class ServiceTests(unittest.TestCase):
+    def test_active_service_returns_ok(self):
+        with patch(
+            "health_monitor.run_command",
+            side_effect=[
+                "systemd 255",
+                "LoadState=loaded\nActiveState=active",
+            ],
+        ):
+            result = health_monitor.get_services({
+                "ssh": {"enabled": True, "unit": "ssh"},
+            })
+
+        self.assertEqual(result, {"ssh": "OK"})
+
+    def test_missing_service_returns_not_installed(self):
+        with patch(
+            "health_monitor.run_command",
+            side_effect=[
+                "systemd 255",
+                "LoadState=not-found\nActiveState=inactive",
+            ],
+        ):
+            result = health_monitor.get_services({
+                "nginx": {"enabled": True, "unit": "nginx"},
+            })
+
+        self.assertEqual(result, {"nginx": "NOT_INSTALLED"})
+
+    def test_disabled_service_is_not_checked(self):
+        with patch("health_monitor.run_command") as mocked_command:
+            result = health_monitor.get_services({
+                "docker": {"enabled": False, "unit": "docker"},
+            })
+
+        self.assertEqual(result, {})
+        mocked_command.assert_not_called()
+

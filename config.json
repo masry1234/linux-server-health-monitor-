@@ -13,6 +13,24 @@
       "warning": 80,
       "critical": 95
     }
+  },
+  "services": {
+    "ssh": {
+      "enabled": true,
+      "unit": "ssh"
+    },
+    "sshd": {
+      "enabled": false,
+      "unit": "sshd"
+    },
+    "docker": {
+      "enabled": true,
+      "unit": "docker"
+    },
+    "nginx": {
+      "enabled": true,
+      "unit": "nginx"
+    }
   }
 }
 
