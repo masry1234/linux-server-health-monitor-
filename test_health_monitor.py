@@ -146,6 +146,31 @@ class SystemDiagnosticsTests(unittest.TestCase):
         )
 
 
+    def test_missing_cpu_data_changes_health_to_unknown(self):
+        report = {
+            "cpu": {"usage_percent": None},
+            "memory": {"usage_percent": 20.0},
+            "disks": [],
+        }
+
+        result = health_monitor.assess_health(report)
+
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["checks"][0]["status"], "UNKNOWN")
+
+    def test_missing_memory_data_changes_health_to_unknown(self):
+        report = {
+            "cpu": {"usage_percent": 20.0},
+            "memory": {"usage_percent": None},
+            "disks": [],
+        }
+
+        result = health_monitor.assess_health(report)
+
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["checks"][1]["status"], "UNKNOWN")
+
+
     def test_critical_cpu_threshold(self):
         thresholds = {
             "cpu": {"warning": 70.0, "critical": 90.0},
@@ -404,4 +429,48 @@ class HtmlReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HistoryTests(unittest.TestCase):
+    def test_load_history_skips_invalid_json_lines(self):
+        valid_report = {
+            "timestamp_utc": "2026-10-13T08:00:00+00:00",
+            "health": {"status": "OK"},
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            history_file = Path(directory) / "health_history.jsonl"
+            history_file.write_text(
+                json.dumps(valid_report) + "\n"
+                "{invalid json}\n"
+                + json.dumps({"health": {"status": "WARNING"}})
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(health_monitor, "HISTORY_FILE", history_file):
+                reports = health_monitor.load_report_history()
+
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0]["health"]["status"], "OK")
+        self.assertEqual(reports[1]["health"]["status"], "WARNING")
+
+    def test_load_history_respects_limit(self):
+        reports_data = [
+            {"id": 1},
+            {"id": 2},
+            {"id": 3},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            history_file = Path(directory) / "health_history.jsonl"
+            history_file.write_text(
+                "".join(json.dumps(report) + "\n" for report in reports_data),
+                encoding="utf-8",
+            )
+
+            with patch.object(health_monitor, "HISTORY_FILE", history_file):
+                reports = health_monitor.load_report_history(limit=2)
+
+        self.assertEqual([report["id"] for report in reports], [2, 3])
 
