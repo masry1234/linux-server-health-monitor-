@@ -24,8 +24,13 @@ DEFAULT_THRESHOLDS = {
     "cpu": {"warning": 80.0, "critical": 95.0},
     "memory": {"warning": 80.0, "critical": 95.0},
     "disk": {"warning": 80.0, "critical": 95.0},
+    "disk_io": {
+        "read_warning_mbps": 100.0,
+        "read_critical_mbps": 200.0,
+        "write_warning_mbps": 100.0,
+        "write_critical_mbps": 200.0,
+    },
 }
-
 
 def setup_logging():
     """Configure rotating file logging with a stderr fallback."""
@@ -91,6 +96,7 @@ def load_thresholds(config_path=None):
         resource: values.copy()
         for resource, values in DEFAULT_THRESHOLDS.items()
     }
+    thresholds["disk_io"] = DEFAULT_THRESHOLDS["disk_io"].copy()
 
     if not config_file.exists():
         return thresholds
@@ -113,7 +119,7 @@ def load_thresholds(config_path=None):
             "Configuration must contain a 'thresholds' object."
         )
 
-    for resource in DEFAULT_THRESHOLDS:
+    for resource in ("cpu", "memory", "disk"):
         values = configured_thresholds.get(resource)
 
         if not isinstance(values, dict):
@@ -148,6 +154,50 @@ def load_thresholds(config_path=None):
             "warning": float(warning),
             "critical": float(critical),
         }
+    disk_io_values = configured_thresholds.get("disk_io")
+
+    if disk_io_values is not None:
+        if not isinstance(disk_io_values, dict):
+            raise TypeError(
+                "Thresholds for 'disk_io' must be an object."
+            )
+
+        disk_io_keys = (
+            "read_warning_mbps",
+            "read_critical_mbps",
+            "write_warning_mbps",
+            "write_critical_mbps",
+        )
+
+        validated_disk_io = {}
+
+        for key in disk_io_keys:
+            value = disk_io_values.get(key)
+
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"disk_io.{key} must be a finite "
+                    "non-negative number."
+                )
+
+            validated_disk_io[key] = float(value)
+
+        for operation in ("read", "write"):
+            warning = validated_disk_io[f"{operation}_warning_mbps"]
+            critical = validated_disk_io[f"{operation}_critical_mbps"]
+
+            if warning >= critical:
+                raise ValueError(
+                    f"disk_io {operation}: warning must be "
+                    "lower than critical."
+                )
+
+        thresholds["disk_io"] = validated_disk_io
 
     return thresholds
 
@@ -691,6 +741,46 @@ def assess_health(report, thresholds=None):
         "memory",
     )
 
+    disk_io_limits = thresholds.get("disk_io")
+    disk_io = report.get("disk_io")
+
+    if disk_io_limits:
+        if not disk_io :
+            checks.append({
+                "name": "disk_io",
+                "status": "UNKNOWN",
+                "value": None,
+                "warning_threshold": None,
+                "critical_threshold": None,
+            })
+        else:
+            for device, metrics in disk_io.items():
+                for operation in ("read", "write"):
+                    value = metrics.get(f"{operation}_bytes_per_sec")
+                    value_mbps = (
+                        value / (1024 * 1024)
+                        if value is not None else None
+                    )
+                    warning = disk_io_limits[f"{operation}_warning_mbps"]
+                    critical = disk_io_limits[f"{operation}_critical_mbps"]
+
+                    if value_mbps is None:
+                        status = "UNKNOWN"
+                    elif value_mbps >= critical:
+                        status = "CRITICAL"
+                    elif value_mbps >= warning:
+                        status = "WARNING"
+                    else:
+                        status = "OK"
+
+                    checks.append({
+                        "name": f"disk_io:{device}:{operation}",
+                        "status": status,
+                        "value": round(value_mbps, 2) if value_mbps is not None else None,
+                        "warning_threshold": warning,
+                        "critical_threshold": critical,
+                    })
+
     for disk in report["disks"]:
         add_check(
             f"disk:{disk['mountpoint']}",
@@ -921,11 +1011,23 @@ def print_report(report):
         )
 
     print("\nCONFIGURED THRESHOLDS")
+
     for resource, limits in report["thresholds"].items():
-        print(
-            f"{resource:<10} warning={limits['warning']}% "
-            f"critical={limits['critical']}%"
-        )
+        if resource == "disk_io":
+            print(
+                "disk_io    "
+                f"read_warning={limits['read_warning_mbps']} MB/s, "
+                f"read_critical={limits['read_critical_mbps']} MB/s, "
+                f"write_warning={limits['write_warning_mbps']} MB/s, "
+                f"write_critical={limits['write_critical_mbps']} MB/s"
+            )
+        else:
+            print(
+                f"{resource:<10} "
+                f"warning={limits['warning']}% "
+                f"critical={limits['critical']}%"
+            )
+
 
     print("\nSYSTEM DIAGNOSTICS")
     print(f"systemd: {diagnostics['systemd_status']}")

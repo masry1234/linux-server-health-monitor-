@@ -216,12 +216,19 @@ class SystemDiagnosticsTests(unittest.TestCase):
         self.assertEqual(checks["memory"]["warning_threshold"], 75.0)
         self.assertEqual(checks["disk:/"]["warning_threshold"], 80.0)
 
+
     def test_load_thresholds_from_config(self):
         config = {
             "thresholds": {
                 "cpu": {"warning": 70, "critical": 90},
                 "memory": {"warning": 75, "critical": 90},
                 "disk": {"warning": 80, "critical": 95},
+                "disk_io": {
+                    "read_warning_mbps": 100,
+                    "read_critical_mbps": 200,
+                    "write_warning_mbps": 100,
+                    "write_critical_mbps": 200,
+                },
             }
         }
 
@@ -237,6 +244,12 @@ class SystemDiagnosticsTests(unittest.TestCase):
         self.assertEqual(thresholds["cpu"]["warning"], 70.0)
         self.assertEqual(thresholds["memory"]["warning"], 75.0)
         self.assertEqual(thresholds["disk"]["critical"], 95.0)
+        self.assertEqual(
+            thresholds["disk_io"]["read_warning_mbps"], 100.0
+        )
+        self.assertEqual(
+            thresholds["disk_io"]["write_critical_mbps"], 200.0
+        )
 
     def test_invalid_threshold_order(self):
         config = {
@@ -244,6 +257,31 @@ class SystemDiagnosticsTests(unittest.TestCase):
                 "cpu": {"warning": 90, "critical": 70},
                 "memory": {"warning": 75, "critical": 90},
                 "disk": {"warning": 80, "critical": 95},
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(config),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                health_monitor.load_thresholds(config_path)
+
+    def test_invalid_disk_io_threshold_order(self):
+        config = {
+            "thresholds": {
+                "cpu": {"warning": 70, "critical": 90},
+                "memory": {"warning": 75, "critical": 90},
+                "disk": {"warning": 80, "critical": 95},
+                "disk_io": {
+                    "read_warning_mbps": 200,
+                    "read_critical_mbps": 100,
+                    "write_warning_mbps": 100,
+                    "write_critical_mbps": 200,
+                },
             }
         }
 
@@ -648,3 +686,85 @@ class DiskIOMetricsTests(unittest.TestCase):
             result = health_monitor.get_disk_io_counters()
 
         self.assertEqual(list(result.keys()), ["sda"])
+
+class DiskIOHealthTests(unittest.TestCase):
+    def setUp(self):
+        self.thresholds = {
+            "cpu": {"warning": 70, "critical": 90},
+            "memory": {"warning": 75, "critical": 90},
+            "disk": {"warning": 80, "critical": 95},
+            "disk_io": {
+                "read_warning_mbps": 100,
+                "read_critical_mbps": 200,
+                "write_warning_mbps": 100,
+                "write_critical_mbps": 200,
+            },
+        }
+
+    def make_report(self, read_mbps, write_mbps):
+        return {
+            "cpu": {"usage_percent": 10},
+            "memory": {"usage_percent": 20},
+            "disks": [],
+            "disk_io": {
+                "sda": {
+                    "read_bytes_per_sec": read_mbps * 1024 * 1024,
+                    "write_bytes_per_sec": write_mbps * 1024 * 1024,
+                }
+            },
+        }
+
+    def test_disk_io_status_is_ok(self):
+        report = self.make_report(50, 60)
+        result = health_monitor.assess_health(report, self.thresholds)
+        checks = {
+            check["name"]: check["status"]
+            for check in result["checks"]
+        }
+        self.assertEqual(checks["disk_io:sda:read"], "OK")
+        self.assertEqual(checks["disk_io:sda:write"], "OK")
+
+    def test_disk_io_status_is_warning(self):
+        report = self.make_report(100, 50)
+        result = health_monitor.assess_health(report, self.thresholds)
+        checks = {
+            check["name"]: check["status"]
+            for check in result["checks"]
+        }
+        self.assertEqual(checks["disk_io:sda:read"], "WARNING")
+
+    def test_disk_io_status_is_critical(self):
+        report = self.make_report(50, 200)
+        result = health_monitor.assess_health(report, self.thresholds)
+        checks = {
+            check["name"]: check["status"]
+            for check in result["checks"]
+        }
+        self.assertEqual(checks["disk_io:sda:write"], "CRITICAL")
+        self.assertEqual(result["status"], "CRITICAL")
+
+    def test_disk_io_status_is_unknown_when_unavailable(self):
+        report = {
+            "cpu": {"usage_percent": 10},
+            "memory": {"usage_percent": 20},
+            "disks": [],
+            "disk_io": None,
+        }
+        result = health_monitor.assess_health(report, self.thresholds)
+        checks = {
+            check["name"]: check["status"]
+            for check in result["checks"]
+        }
+        self.assertEqual(checks["disk_io"], "UNKNOWN")
+
+    def test_disk_io_status_is_unknown_when_empty(self):
+        report = self.make_report(0, 0)
+        report["disk_io"] = {}
+
+        result = health_monitor.assess_health(report, self.thresholds)
+        checks = {
+            check["name"]: check["status"]
+            for check in result["checks"]
+        }
+
+        self.assertEqual(checks["disk_io"], "UNKNOWN")
