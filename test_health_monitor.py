@@ -76,6 +76,28 @@ class SystemDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["failed_units_status"], "ok")
         self.assertEqual(result["failed_units"], [])
 
+    def test_failed_systemd_unit_changes_health_to_warning(self):
+        report = {
+            "cpu": {"usage_percent": 10.0},
+            "memory": {"usage_percent": 20.0},
+            "disks": [],
+            "system_diagnostics": {
+                "failed_units_status": "issues_found",
+                "failed_units": [
+                    {"unit": "example.service", "active": "failed"}
+                ],
+            },
+        }
+
+        result = health_monitor.assess_health(report)
+
+        self.assertEqual(result["status"], "WARNING")
+        self.assertIn(
+            "failed_systemd_units",
+            [check["name"] for check in result["checks"]],
+        )
+
+
     def test_health_thresholds(self):
         thresholds = {
             "cpu": {"warning": 70.0, "critical": 90.0},
@@ -95,6 +117,34 @@ class SystemDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["checks"][0]["status"], "WARNING")
         self.assertEqual(result["checks"][0]["warning_threshold"], 70.0)
         self.assertEqual(result["checks"][0]["critical_threshold"], 90.0)
+
+    def test_critical_health_takes_priority_over_failed_units(self):
+        thresholds = {
+            "cpu": {"warning": 70.0, "critical": 90.0},
+            "memory": {"warning": 75.0, "critical": 90.0},
+            "disk": {"warning": 80.0, "critical": 95.0},
+        }
+
+        report = {
+            "cpu": {"usage_percent": 95.0},
+            "memory": {"usage_percent": 20.0},
+            "disks": [],
+            "system_diagnostics": {
+                "failed_units_status": "issues_found",
+                "failed_units": [
+                    {"unit": "example.service", "active": "failed"}
+                ],
+            },
+        }
+
+        result = health_monitor.assess_health(report, thresholds)
+
+        self.assertEqual(result["status"], "CRITICAL")
+        self.assertIn(
+            "failed_systemd_units",
+            [check["name"] for check in result["checks"]],
+        )
+
 
     def test_critical_cpu_threshold(self):
         thresholds = {

@@ -590,6 +590,20 @@ def assess_health(report, thresholds=None):
             "disk",
         )
 
+
+    diagnostics = report.get("system_diagnostics") or {}
+    failed_units_status = diagnostics.get("failed_units_status")
+    failed_units = diagnostics.get("failed_units") or []
+
+    if failed_units_status == "issues_found" or failed_units:
+        checks.append({
+            "name": "failed_systemd_units",
+            "status": "WARNING",
+            "value": len(failed_units) if failed_units else "issues_found",
+            "warning_threshold": 0,
+            "critical_threshold": None,
+        })
+
     statuses = [item["status"] for item in checks]
 
     if "CRITICAL" in statuses:
