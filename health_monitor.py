@@ -161,14 +161,21 @@ def get_cpu_times():
             return None
 
         values = [int(value) for value in fields[1:]]
-        idle = values[3] if len(values) > 3 else 0
-        iowait = values[4] if len(values) > 4 else 0
 
-        return sum(values), idle + iowait
+        if len(values) < 5 or any(value < 0 for value in values):
+            return None
+
+        idle = values[3]
+        iowait = values[4]
+
+        return {
+            "total": sum(values),
+            "idle": idle + iowait,
+            "iowait": iowait,
+        }
 
     except (OSError, ValueError, IndexError):
         return None
-
 
 def get_cpu_usage():
     first = get_cpu_times()
@@ -180,15 +187,32 @@ def get_cpu_usage():
     if second is None:
         return None
 
-    total_delta = second[0] - first[0]
-    idle_delta = second[1] - first[1]
+    total_delta = second["total"] - first["total"]
+    idle_delta = second["idle"] - first["idle"]
 
     if total_delta <= 0 or idle_delta < 0:
         return None
 
     usage = 100 * (1 - idle_delta / total_delta)
     return round(max(0.0, min(100.0, usage)), 1)
+def get_cpu_iowait():
+    first = get_cpu_times()
+    if first is None:
+        return None
 
+    time.sleep(1)
+    second = get_cpu_times()
+    if second is None:
+        return None
+
+    total_delta = second["total"] - first["total"]
+    iowait_delta = second["iowait"] - first["iowait"]
+
+    if total_delta <= 0 or iowait_delta < 0:
+        return None
+
+    percentage = 100 * iowait_delta / total_delta
+    return round(max(0.0, min(100.0, percentage)), 1)
 
 def get_memory():
     info = {}
@@ -280,6 +304,73 @@ def get_disks():
             continue
 
     return disks
+
+def get_disk_io_counters():
+    counters = {}
+
+    try:
+        with open("/proc/diskstats", encoding="utf-8") as file:
+            for line in file:
+                fields = line.split()
+
+                if len(fields) < 14:
+                    continue
+
+                device = fields[2]
+                if device.startswith(("ram", "loop")):
+                    continue
+
+                try:
+                    sectors_read = int(fields[5])
+                    sectors_written = int(fields[9])
+                except ValueError:
+                    continue
+
+                if sectors_read < 0 or sectors_written < 0:
+                    continue
+
+                counters[device] = {
+                    "read_bytes": sectors_read * 512,
+                    "write_bytes": sectors_written * 512,
+                }
+
+    except OSError:
+        return None
+
+    return counters
+
+def get_disk_io_rates(interval=1):
+    if interval <= 0:
+        raise ValueError("interval must be greater than zero")
+    first = get_disk_io_counters()
+    if first is None:
+        return None
+
+    time.sleep(interval)
+
+    second = get_disk_io_counters()
+    if second is None:
+        return None
+
+    rates = {}
+
+    for device, current in second.items():
+        previous = first.get(device)
+        if previous is None:
+            continue
+
+        read_delta = current["read_bytes"] - previous["read_bytes"]
+        write_delta = current["write_bytes"] - previous["write_bytes"]
+
+        if read_delta < 0 or write_delta < 0:
+            continue
+
+        rates[device] = {
+            "read_bytes_per_sec": round(read_delta / interval, 1),
+            "write_bytes_per_sec": round(write_delta / interval, 1),
+        }
+
+    return rates
 
 
 def get_network():
@@ -751,11 +842,13 @@ def collect_report(logger=None):
             "cpu_count": os.cpu_count(),
             "load_average": get_load_average(),
         },
-        "cpu": {
+     "cpu": {
             "usage_percent": get_cpu_usage(),
-        },
+            "iowait_percent": get_cpu_iowait(),
+            },
         "memory": get_memory(),
         "disks": get_disks(),
+        "disk_io": get_disk_io_rates(),
         "network": get_network(),
         "listening_sockets": get_listening_sockets(),
         "services": get_services(service_config),
@@ -792,9 +885,28 @@ def print_report(report):
     print(f"Kernel:        {system['os']['kernel']}")
     print(f"CPU cores:     {system['cpu_count']}")
     print(f"CPU usage:     {report['cpu']['usage_percent']}%")
+    print(f"CPU iowait:    {report['cpu'].get('iowait_percent')}%")
     print(f"RAM usage:     {memory.get('usage_percent')}%")
     print(f"Swap usage:    {memory.get('swap_usage_percent')}%")
     print(f"Load average:  {system['load_average']}")
+
+    print("\nDISK I/O")
+    disk_io = report.get("disk_io")
+
+    if disk_io is None:
+        print("Disk I/O data unavailable")
+    elif not disk_io:
+        print("No disk I/O data available")
+    else:
+        for device, metrics in disk_io.items():
+            read_rate = metrics["read_bytes_per_sec"] / (1024 * 1024)
+            write_rate = metrics["write_bytes_per_sec"] / (1024 * 1024)
+
+            print(
+                f"{device}: Read {read_rate:.2f} MB/s | "
+                f"Write {write_rate:.2f} MB/s"
+            )
+
     print(f"Uptime:        {system['uptime_seconds']} seconds")
 
     print("\nRESOURCE HEALTH")

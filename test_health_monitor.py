@@ -513,3 +513,138 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result, {})
         mocked_command.assert_not_called()
 
+
+class CpuMetricsTests(unittest.TestCase):
+    def test_get_cpu_times_returns_expected_fields(self):
+        cpu_line = "cpu 100 20 30 400 50 10 5 2 0 0\n"
+
+        with patch(
+            "builtins.open",
+            unittest.mock.mock_open(read_data=cpu_line),
+        ):
+            result = health_monitor.get_cpu_times()
+
+        self.assertEqual(
+            result,
+            {
+                "total": 617,
+                "idle": 450,
+                "iowait": 50,
+            },
+        )
+
+    def test_get_cpu_iowait_calculates_percentage(self):
+        first = {
+            "total": 1000,
+            "idle": 700,
+            "iowait": 50,
+        }
+        second = {
+            "total": 1100,
+            "idle": 770,
+            "iowait": 70,
+        }
+
+        with patch(
+            "health_monitor.get_cpu_times",
+            side_effect=[first, second],
+        ), patch("health_monitor.time.sleep"):
+            result = health_monitor.get_cpu_iowait()
+
+        self.assertEqual(result, 20.0)
+
+    def test_get_cpu_iowait_returns_none_when_data_unavailable(self):
+        with patch(
+            "health_monitor.get_cpu_times",
+            return_value=None,
+        ):
+            result = health_monitor.get_cpu_iowait()
+
+        self.assertIsNone(result)
+
+
+class DiskIOMetricsTests(unittest.TestCase):
+    def test_get_disk_io_counters_converts_sectors_to_bytes(self):
+        diskstats = (
+            "1 0 ram0 0 0 100 0 0 0 200 0 0 0 0\n"
+            "7 0 loop0 0 0 300 0 0 0 400 0 0 0 0\n"
+            "8 0 sda 100 0 200 10 300 0 400 20 "
+            "0 30 40\n"
+        )
+        with patch(
+            "builtins.open",
+            unittest.mock.mock_open(read_data=diskstats),
+        ):
+            result = health_monitor.get_disk_io_counters()
+
+        self.assertEqual(
+            result,
+            {
+                "sda": {
+                    "read_bytes": 200 * 512,
+                    "write_bytes": 400 * 512,
+                },
+            },
+        )
+
+    def test_get_disk_io_rates_calculates_bytes_per_second(self):
+        first = {
+            "sda": {
+                "read_bytes": 1000,
+                "write_bytes": 2000,
+            },
+        }
+        second = {
+            "sda": {
+                "read_bytes": 3000,
+                "write_bytes": 5000,
+            },
+        }
+
+        with patch(
+            "health_monitor.get_disk_io_counters",
+            side_effect=[first, second],
+        ), patch("health_monitor.time.sleep"):
+            result = health_monitor.get_disk_io_rates(interval=1)
+
+        self.assertEqual(
+            result,
+            {
+                "sda": {
+                    "read_bytes_per_sec": 2000.0,
+                    "write_bytes_per_sec": 3000.0,
+                },
+            },
+        )
+
+    def test_get_disk_io_rates_returns_none_when_data_unavailable(self):
+        with patch(
+            "health_monitor.get_disk_io_counters",
+            return_value=None,
+        ):
+            result = health_monitor.get_disk_io_rates()
+
+        self.assertIsNone(result)
+
+    def test_get_disk_io_rates_rejects_zero_interval(self):
+        with self.assertRaises(ValueError):
+            health_monitor.get_disk_io_rates(interval=0)
+
+    def test_get_disk_io_rates_rejects_negative_interval(self):
+        with self.assertRaises(ValueError):
+            health_monitor.get_disk_io_rates(interval=-1)
+    def test_get_disk_io_counters_excludes_ram_and_loop(self):
+        diskstats = (
+            "1 0 ram0 0 0 100 0 0 0 200 0 0 0 0\n"
+            "7 0 loop0 0 0 300 0 0 0 400 0 0 0 0\n"
+            "8 0 sda 100 0 200 10 300 0 400 20 "
+            "0 30 40\n"
+        )
+
+        with patch(
+            "builtins.open",
+            unittest.mock.mock_open(read_data=diskstats),
+        ):
+            result = health_monitor.get_disk_io_counters()
+
+        self.assertEqual(list(result.keys()), ["sda"])
