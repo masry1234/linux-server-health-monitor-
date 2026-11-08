@@ -324,7 +324,6 @@ def get_disks():
         "-x", "devtmpfs",
         "-x", "overlay",
         "-x", "squashfs",
-        "-x", "9p",
         "-x", "drvfs",
     ])
 
@@ -339,6 +338,18 @@ def get_disks():
             continue
 
         filesystem, fs_type, total, used, available, percent, mount = fields
+
+        # Exclude WSL system mounts and pseudo filesystems.
+        if mount == "/init" or mount.startswith("/usr/lib/"):
+            continue
+
+        # Keep Windows drive mounts, but ignore other 9p mounts.
+        if fs_type == "9p" and not (
+            mount.startswith("/mnt/")
+            and len(mount) == 6
+            and mount[-1].isalpha()
+        ):
+            continue
 
         try:
             disks.append({
@@ -1205,20 +1216,47 @@ def generate_html_report(report, history=None):
         warning = check.get("warning_threshold", "n/a")
         critical = check.get("critical_threshold", "n/a")
         status = check.get("status", "unknown")
-        unit = "%" if name in {"cpu", "memory"} or name.startswith("disk:") else ""
+
+        display_name = name
+        unit = ""
+
+        if name.startswith("disk_io:"):
+            parts = name.split(":")
+            if len(parts) == 3:
+                _, device, operation = parts
+                operation_name = {
+                    "read": "Read",
+                    "write": "Write",
+                }.get(operation, operation.title())
+                display_name = (
+                    f"Disk {operation_name} Throughput ({device})"
+                )
+            unit = " MB/s"
+        elif name in {"cpu", "memory"} or name.startswith("disk:"):
+            unit = "%"
 
         try:
-            progress = max(0.0, min(100.0, float(value)))
+            numeric_value = float(value)
+            if name.startswith("disk_io:"):
+                critical_value = float(critical)
+                progress = (
+                    numeric_value / critical_value * 100
+                    if critical_value > 0 else 0
+                )
+            else:
+                progress = numeric_value
+
+            progress = max(0.0, min(100.0, progress))
             progress_width = f"{progress:.1f}"
         except (TypeError, ValueError):
             progress_width = "0"
 
         cards.append(
             '<article class="metric card">'
-            f'<div class="metric-name">{esc(name)}</div>'
+            f'<div class="metric-name">{esc(display_name)}</div>'
             f'<div class="metric-value">{esc(value)}{unit}</div>'
             f'<div class="progress-track" role="progressbar" '
-            f'aria-label="{esc(name)} usage" aria-valuemin="0" '
+            f'aria-label="{esc(display_name)}" aria-valuemin="0" '
             f'aria-valuemax="100" aria-valuenow="{progress_width}">'
             f'<div class="progress-fill {status_class(status)}" '
             f'style="width: {progress_width}%"></div></div>'
