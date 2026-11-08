@@ -1,32 +1,109 @@
 # Linux Server Health Monitor
 
-A Python-based Linux system monitoring and diagnostics tool that collects system metrics, evaluates resource health, inspects system services, and generates JSON and HTML reports.
+A Python-based Linux system monitoring and diagnostics tool designed to collect system metrics, evaluate resource health, inspect system services, analyze disk I/O activity, and generate structured JSON and HTML reports.
 
-Designed for Linux troubleshooting, system administration, and infrastructure monitoring practice.
+Built for Linux system administration, server troubleshooting, infrastructure monitoring, and security operations.
 
-## Features
+## Key Features
 
-- **System Resources:** CPU usage, logical CPU count, RAM, swap, disk utilization, load average, and uptime.
-- **Network Diagnostics:** Network interfaces, IP addresses, and listening TCP/UDP sockets.
-- **Process Monitoring:** Identifies top processes by CPU usage.
-- **Service Diagnostics:** Checks configured services, systemd state, and failed units when available.
-- **Log Diagnostics:** Collects recent system errors and warnings when supported by the environment.
-- **Health Checks:** Evaluates resource usage against configurable thresholds.
-- **JSON Reports:** Prints JSON output or saves it to a file.
-- **HTML Dashboard:** Generates a standalone HTML report for readable system-health summaries.
-- **Logging:** Supports rotating log files with a fallback to standard error.
-- **Automated Tests:** Unit tests for monitoring, diagnostics, reporting, and logging.
-- **Code Quality:** Ruff linting and GitHub Actions continuous integration.
+### System Resource Monitoring
+- CPU utilization and logical CPU count.
+- CPU I/O wait monitoring.
+- RAM and Swap utilization.
+- Disk capacity and filesystem utilization.
+- System load average and uptime.
+
+### Disk I/O Monitoring
+- Disk read/write throughput.
+- Read/write operation counters.
+- Read/write time metrics.
+- Disk I/O rate calculations.
+- Configurable disk I/O health thresholds.
+- Handling of unavailable or invalid metric data.
+
+### Network Diagnostics
+- Network interface information.
+- IP address detection.
+- Listening TCP and UDP sockets.
+
+### Process Monitoring
+- Top processes by CPU utilization.
+- Process-level resource information.
+
+### System Service Diagnostics
+- Configurable service monitoring.
+- Systemd service status checks.
+- Failed systemd unit detection.
+- System health degradation assessment.
+
+### Health Assessment
+- Configurable CPU, memory, disk, and disk I/O thresholds.
+- Warning and critical health states.
+- Historical health data collection.
+- Health status evaluation.
+
+### Reporting
+- JSON report generation.
+- Standalone HTML health dashboard.
+- System diagnostics summaries.
+- Historical health data stored in JSONL format.
+
+### Logging and Reliability
+- Rotating log files.
+- Standard error fallback.
+- Graceful handling of unavailable system metrics.
+
+### Development and Quality
+- Automated Python unit tests.
+- Ruff linting.
+- GitHub Actions continuous integration.
+
+## Technology Stack
+
+| Technology | Purpose |
+|---|---|
+| Python 3 | Core application |
+| Linux / Ubuntu | Operating environment |
+| Bash | System administration |
+| `/proc` | System metrics collection |
+| systemctl | Service diagnostics |
+| ip / ss | Network diagnostics |
+| df / free | Resource monitoring |
+| JSON / JSONL | Data storage and reporting |
+| HTML / CSS | Health dashboard |
+| unittest | Automated testing |
+| Ruff | Code quality |
+| GitHub Actions | Continuous integration |
+
+## Project Structure
+
+```text
+linux-server-health-monitor/
+│
+├── .github/
+│   └── workflows/
+│
+├── logs/
+│
+├── health_monitor.py
+├── test_health_monitor.py
+├── config.json
+├── health_history.jsonl
+├── report.json
+├── report.html
+├── README.md
+└── .gitignore
+```
 
 ## Requirements
 
 - Python 3
-- Linux, or Ubuntu under WSL2
+- Linux or Ubuntu under WSL2
 - Git
-- `jq` (optional, for inspecting JSON reports)
-- `systemd` and other Linux utilities for certain diagnostic features
+- systemd and standard Linux utilities for supported diagnostics
+- jq (optional, for JSON inspection)
 
-Some features depend on available system utilities, permissions, and the host environment.
+Some monitoring features depend on kernel interfaces, system permissions, and available system utilities.
 
 ## Installation
 
@@ -34,27 +111,27 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/masry1234/linux-server-health-monitor-.git
+
 cd linux-server-health-monitor-
 ```
 
-Create and activate a virtual environment:
+Create a virtual environment:
 
 ```bash
 python3 -m venv .venv
+
 source .venv/bin/activate
 ```
 
-No additional Python package installation is required unless the project dependencies change.
-
 ## Usage
 
-Run the monitor and display the report:
+Run the monitoring tool:
 
 ```bash
 python health_monitor.py
 ```
 
-Print the report as JSON:
+Display JSON output:
 
 ```bash
 python health_monitor.py --json
@@ -72,25 +149,37 @@ Generate an HTML dashboard:
 python health_monitor.py --html report.html
 ```
 
-Generate both JSON and HTML reports:
+Generate both reports:
 
 ```bash
 python health_monitor.py --output report.json --html report.html
 ```
 
-Display available command-line options:
+Display available options:
 
 ```bash
 python health_monitor.py --help
 ```
 
-### Inspect JSON Reports
+## Configuration
 
-If `jq` is installed, inspect selected report sections:
+Monitoring thresholds are configurable through:
+
+```text
+config.json
+```
+
+This allows resource health evaluation to be adjusted according to monitoring requirements.
+
+## Example JSON Inspection
+
+Using jq:
 
 ```bash
 jq '.health' report.json
+
 jq '.listening_sockets' report.json
+
 jq '.system_diagnostics.errors' report.json
 ```
 
@@ -99,41 +188,44 @@ jq '.system_diagnostics.errors' report.json
 Run the automated unit tests:
 
 ```bash
-python -m unittest -v test_health_monitor.py
+python -m unittest -v
 ```
 
-Run Ruff lint checks if installed:
+Run code quality checks:
 
 ```bash
-python -m ruff check .
+ruff check .
 ```
 
-Check the latest workflow results in the repository's **Actions** tab on GitHub.
+The current development test suite contains 38 unit tests.
 
 ## Platform Compatibility
 
-The project is currently developed and tested in Ubuntu under Windows Subsystem for Linux 2 (WSL2).
+The project is currently developed and tested using Ubuntu on Windows Subsystem for Linux 2 (WSL2).
 
-WSL2 does not expose every hardware metric, kernel interface, or systemd feature available on a native Linux server. Some diagnostics may therefore be unavailable or reflect WSL2 limitations rather than actual server faults.
+WSL2 may not expose all hardware metrics, kernel interfaces, or systemd capabilities available on native Linux servers.
 
-For production Linux environments, validate the results against the target distribution, available permissions, and installed system utilities.
+For production environments, validate monitoring results against the target Linux distribution and available system permissions.
 
 ## Security Considerations
 
 - Run with the minimum privileges required.
-- Review reports and logs before sharing them publicly.
-- Do not commit credentials, access tokens, or sensitive infrastructure data.
-- Treat process details, IP addresses, listening sockets, and system logs as potentially sensitive information.
-- Review any commands before running them with elevated privileges.
+- Review reports before sharing them.
+- Never commit credentials, access tokens, or sensitive infrastructure information.
+- Treat IP addresses, process details, listening sockets, and system logs as potentially sensitive.
+- Review commands before executing them with elevated privileges.
 
 ## Roadmap
 
-- [ ] Validate compatibility across additional Linux distributions.
-- [ ] Add optional alert delivery through email or other notification channels.
-- [ ] Improve integration testing on native Linux systems.
-- [ ] Add historical metric storage and trend analysis.
-- [ ] Document deployment and scheduling options for periodic monitoring.
+- [ ] Expand compatibility testing across Linux distributions.
+- [ ] Add optional Telegram and email notifications.
+- [ ] Improve native Linux integration testing.
+- [ ] Add advanced historical trend visualization.
+- [ ] Add deployment and scheduling documentation.
+- [ ] Expand monitoring coverage and diagnostic capabilities.
 
 ## License
 
-No license has been selected yet. All rights reserved by default until a license is added to the repository.
+No license has been selected yet.
+
+Until a license is added, the project remains under the default copyright terms.
