@@ -371,17 +371,36 @@ def get_disk_io_counters():
                     continue
 
                 try:
+                    reads_completed = int(fields[3])
                     sectors_read = int(fields[5])
+                    read_time_ms = int(fields[6])
+                    writes_completed = int(fields[7])
                     sectors_written = int(fields[9])
+                    write_time_ms = int(fields[10])
+                    io_time_ms = int(fields[12])
                 except ValueError:
                     continue
 
-                if sectors_read < 0 or sectors_written < 0:
+                values = (
+                    reads_completed,
+                    sectors_read,
+                    read_time_ms,
+                    writes_completed,
+                    sectors_written,
+                    write_time_ms,
+                    io_time_ms,
+                )
+                if any(value < 0 for value in values):
                     continue
 
                 counters[device] = {
                     "read_bytes": sectors_read * 512,
                     "write_bytes": sectors_written * 512,
+                    "reads_completed": reads_completed,
+                    "read_time_ms": read_time_ms,
+                    "writes_completed": writes_completed,
+                    "write_time_ms": write_time_ms,
+                    "io_time_ms": io_time_ms,
                 }
 
     except OSError:
@@ -389,9 +408,11 @@ def get_disk_io_counters():
 
     return counters
 
+
 def get_disk_io_rates(interval=1):
     if interval <= 0:
         raise ValueError("interval must be greater than zero")
+
     first = get_disk_io_counters()
     if first is None:
         return None
@@ -411,17 +432,53 @@ def get_disk_io_rates(interval=1):
 
         read_delta = current["read_bytes"] - previous["read_bytes"]
         write_delta = current["write_bytes"] - previous["write_bytes"]
+        reads_delta = (
+            current["reads_completed"] - previous["reads_completed"]
+        )
+        writes_delta = (
+            current["writes_completed"] - previous["writes_completed"]
+        )
+        read_time_delta = current["read_time_ms"] - previous["read_time_ms"]
+        write_time_delta = (
+            current["write_time_ms"] - previous["write_time_ms"]
+        )
+        io_time_delta = current["io_time_ms"] - previous["io_time_ms"]
 
-        if read_delta < 0 or write_delta < 0:
+        deltas = (
+            read_delta,
+            write_delta,
+            reads_delta,
+            writes_delta,
+            read_time_delta,
+            write_time_delta,
+            io_time_delta,
+        )
+
+        if any(delta < 0 for delta in deltas):
             continue
+
+        interval_ms = interval * 1000
 
         rates[device] = {
             "read_bytes_per_sec": round(read_delta / interval, 1),
             "write_bytes_per_sec": round(write_delta / interval, 1),
+            "read_latency_ms": (
+                round(read_time_delta / reads_delta, 2)
+                if reads_delta > 0
+                else None
+            ),
+            "write_latency_ms": (
+                round(write_time_delta / writes_delta, 2)
+                if writes_delta > 0
+                else None
+            ),
+            "io_utilization_percent": round(
+                io_time_delta / interval_ms * 100,
+                2,
+            ),
         }
 
     return rates
-
 
 def get_network():
     output = run_command(["ip", "-j", "address", "show"])

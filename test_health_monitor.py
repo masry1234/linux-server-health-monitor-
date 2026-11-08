@@ -621,21 +621,35 @@ class DiskIOMetricsTests(unittest.TestCase):
                 "sda": {
                     "read_bytes": 200 * 512,
                     "write_bytes": 400 * 512,
+                    "reads_completed": 100,
+                    "read_time_ms": 10,
+                    "writes_completed": 300,
+                    "write_time_ms": 20,
+                    "io_time_ms": 30,
                 },
             },
         )
-
     def test_get_disk_io_rates_calculates_bytes_per_second(self):
         first = {
             "sda": {
                 "read_bytes": 1000,
                 "write_bytes": 2000,
+                "reads_completed": 10,
+                "read_time_ms": 100,
+                "writes_completed": 20,
+                "write_time_ms": 200,
+                "io_time_ms": 100,
             },
         }
         second = {
             "sda": {
                 "read_bytes": 3000,
                 "write_bytes": 5000,
+                "reads_completed": 20,
+                "read_time_ms": 150,
+                "writes_completed": 30,
+                "write_time_ms": 260,
+                "io_time_ms": 600,
             },
         }
 
@@ -651,6 +665,9 @@ class DiskIOMetricsTests(unittest.TestCase):
                 "sda": {
                     "read_bytes_per_sec": 2000.0,
                     "write_bytes_per_sec": 3000.0,
+                    "read_latency_ms": 5.0,
+                    "write_latency_ms": 6.0,
+                    "io_utilization_percent": 50.0,
                 },
             },
         )
