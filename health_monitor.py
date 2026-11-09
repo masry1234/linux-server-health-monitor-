@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.9.0"
 MAX_LOG_MESSAGES = 20
 
 LOG_DIR = Path(__file__).with_name("logs")
@@ -352,6 +352,12 @@ def get_disks():
             continue
 
         try:
+            is_wsl_drive = (
+                fs_type == "9p"
+                and mount.startswith("/mnt/")
+                and len(mount) == 6
+                and mount[-1].isalpha()
+            )
             disks.append({
                 "filesystem": filesystem,
                 "type": fs_type,
@@ -360,6 +366,8 @@ def get_disks():
                 "used_bytes": int(used) * 1024,
                 "available_bytes": int(available) * 1024,
                 "usage_percent": int(percent.rstrip("%")),
+                "monitored": not is_wsl_drive,
+                "excluded_reason": "WSL Windows drive mount" if is_wsl_drive else None,
             })
         except ValueError:
             continue
@@ -491,6 +499,62 @@ def get_disk_io_rates(interval=1):
 
     return rates
 
+# Network byte counters are sampled between dashboard collection cycles.
+_network_sample_lock = __import__("threading").Lock()
+_network_previous = {}
+_network_previous_time = None
+
+def get_network_io_rates():
+    """Return aggregate RX/TX throughput in MB/s from /proc/net/dev."""
+    global _network_previous, _network_previous_time
+    now = time.monotonic()
+    current = {}
+    try:
+        with open("/proc/net/dev", encoding="utf-8") as file:
+            for line in file.readlines()[2:]:
+                if ":" not in line:
+                    continue
+                name, values = line.split(":", 1)
+                fields = values.split()
+                if len(fields) < 9:
+                    continue
+                interface = name.strip()
+                if interface == "lo":
+                    continue
+                current[interface] = (int(fields[0]), int(fields[8]))
+    except (OSError, ValueError):
+        return {"rx_mbps": 0.0, "tx_mbps": 0.0, "interfaces": {}, "sample_ready": False}
+
+    with _network_sample_lock:
+        previous = _network_previous
+        previous_time = _network_previous_time
+        elapsed = now - previous_time if previous_time is not None else 0
+        rx_total = tx_total = 0.0
+        per_interface = {}
+        for name, (rx, tx) in current.items():
+            old_rx, old_tx = previous.get(name, (rx, tx))
+            rx_rate = max(0, rx - old_rx) / elapsed / 1_000_000 if elapsed > 0 else 0.0
+            tx_rate = max(0, tx - old_tx) / elapsed / 1_000_000 if elapsed > 0 else 0.0
+            per_interface[name] = {
+                "rx_mbps": round(rx_rate, 3),
+                "tx_mbps": round(tx_rate, 3),
+                "total_rx_bytes": rx,
+                "total_tx_bytes": tx,
+            }
+            rx_total += rx_rate
+            tx_total += tx_rate
+        _network_previous = current
+        _network_previous_time = now
+    return {
+        "rx_mbps": round(rx_total, 3),
+        "tx_mbps": round(tx_total, 3),
+        "interfaces": per_interface,
+        "total_rx_bytes": sum(item[0] for item in current.values()),
+        "total_tx_bytes": sum(item[1] for item in current.values()),
+        "sample_ready": elapsed > 0,
+    }
+
+
 def get_network():
     output = run_command(["ip", "-j", "address", "show"])
     if output is None:
@@ -525,6 +589,14 @@ def get_network():
         })
 
     return interfaces
+
+
+def get_active_connection_count():
+    """Count established TCP connections; None means ss is unavailable."""
+    output = run_command(["ss", "-H", "-tn", "state", "established"])
+    if output is None:
+        return None
+    return sum(1 for line in output.splitlines() if line.strip())
 
 
 def get_listening_sockets():
@@ -617,7 +689,7 @@ def get_services(service_config=None):
 
 def get_top_processes():
     output = run_command([
-        "ps", "-eo", "pid,comm,pcpu,pmem",
+        "ps", "-eo", "pid,user,pcpu,pmem,args",
         "--sort=-pcpu",
     ])
 
@@ -627,16 +699,20 @@ def get_top_processes():
     processes = []
 
     for line in output.splitlines()[1:6]:
-        fields = line.split(None, 3)
-        if len(fields) != 4:
+        fields = line.split(None, 4)
+        if len(fields) != 5:
             continue
 
         try:
+            # args may contain spaces; split leaves the full command in field 4.
+            cpu_value, memory_value, command = fields[2], fields[3], fields[4]
             processes.append({
                 "pid": int(fields[0]),
-                "name": fields[1],
-                "cpu_percent": float(fields[2]),
-                "memory_percent": float(fields[3]),
+                "user": fields[1],
+                "name": command.split()[0] if command else "unknown",
+                "command": command,
+                "cpu_percent": float(cpu_value),
+                "memory_percent": float(memory_value),
             })
         except ValueError:
             continue
@@ -678,6 +754,31 @@ def get_load_average():
     except (OSError, AttributeError):
         return None
 
+
+
+
+def is_wsl_environment():
+    """Return True when the current kernel identifies itself as WSL."""
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8").lower()
+        return "microsoft" in release or "wsl" in release
+    except OSError:
+        return False
+
+
+def is_wsl_host_noise(message):
+    """Identify noisy WSL/Hyper-V host integration messages."""
+    text = str(message).lower()
+    markers = (
+        "wsl (104) error: checkconnection",
+        "wsl (105) error: checkconnection",
+        "hv_balloon:",
+        "hyper-v does not support order",
+        "no config space access function found",
+        "device-mapper: core: config_ima_disable_htable",
+        "failed to connect to system scope bus via local transport",
+    )
+    return any(marker in text for marker in markers)
 
 def get_system_diagnostics():
     """Collect systemd state, failed units, and bounded journal samples."""
@@ -754,14 +855,17 @@ def get_system_diagnostics():
                 "messages": [],
             }
 
-        messages = [
-            line for line in output.splitlines()
-            if line.strip()
-        ]
+        messages = [line for line in output.splitlines() if line.strip()]
+        suppressed = 0
+        if is_wsl_environment():
+            filtered = [line for line in messages if is_wsl_host_noise(line)]
+            suppressed = len(filtered)
+            messages = [line for line in messages if not is_wsl_host_noise(line)]
 
         return {
             "status": "ok",
             "count": len(messages),
+            "suppressed_wsl_noise": suppressed,
             "messages": messages,
         }
 
@@ -778,10 +882,10 @@ def get_system_diagnostics():
     }
 
 
-def assess_health(report, thresholds=None):
+def assess_health(report, thresholds=None, exclude_mountpoints=None):
     checks = []
     thresholds = thresholds or DEFAULT_THRESHOLDS
-
+    exclude_mountpoints = set(exclude_mountpoints or [])
     def add_check(name, value, resource):
         limits = thresholds[resource]
 
@@ -850,12 +954,16 @@ def assess_health(report, thresholds=None):
                     })
 
     for disk in report["disks"]:
+        if disk["mountpoint"] in exclude_mountpoints or disk.get("monitored") is False:
+            continue
+        if disk.get("type") == "9p" and str(disk.get("mountpoint", "")).startswith("/mnt/"):
+            continue
+
         add_check(
             f"disk:{disk['mountpoint']}",
             disk["usage_percent"],
             "disk",
         )
-
 
     diagnostics = report.get("system_diagnostics") or {}
     failed_units_status = diagnostics.get("failed_units_status")
@@ -915,7 +1023,9 @@ def show_history(limit=10):
                 if not line.strip():
                     continue
                 try:
-                    reports.append(json.loads(line))
+                    report = json.loads(line)
+                    if isinstance(report, dict):
+                        reports.append(report)
                 except json.JSONDecodeError:
                     continue
     except OSError as error:
@@ -1008,24 +1118,30 @@ def collect_report(logger=None):
         "disks": get_disks(),
         "disk_io": get_disk_io_rates(),
         "network": get_network(),
+        "network_io": get_network_io_rates(),
         "listening_sockets": get_listening_sockets(),
         "services": get_services(service_config),
         "top_processes": get_top_processes(),
         "system_diagnostics": get_system_diagnostics(),
+        "active_connections": get_active_connection_count(),
     }
 
     report["thresholds"] = thresholds
-    report["health"] = assess_health(report, thresholds)
+    health_config = config.get("health", {})
+    exclude_mountpoints = health_config.get(
+        "exclude_mountpoints", []
+    )
+    for disk in report["disks"]:
+        if disk.get("mountpoint") in exclude_mountpoints:
+            disk["monitored"] = False
+            disk["excluded_reason"] = "Configured exclusion"
 
-    health_status = report["health"]["status"]
-    if health_status == "CRITICAL":
-        logger.critical("Health assessment status: %s", health_status)
-    elif health_status == "WARNING" or health_status == "UNKNOWN":
-        logger.warning("Health assessment status: %s", health_status)
-    else:
-        logger.info("Health assessment status: %s", health_status)
+    report["health"] = assess_health(
+        report,
+        thresholds,
+        exclude_mountpoints,
+    )
 
-    logger.info("Health report collection completed")
     return report
 
 
@@ -1276,11 +1392,12 @@ def generate_html_report(report, history=None):
             f"<td>{esc(disk.get('mountpoint'))}</td>"
             f"<td>{esc(disk.get('usage_percent'))}%</td>"
             f"<td>{esc(disk.get('type'))}</td>"
+            f"<td>{'Excluded from health' if disk.get('monitored') is False else 'Monitored'}</td>"
             "</tr>"
         )
 
     if not disk_rows:
-        disk_rows.append('<tr><td colspan="3">No disk information available.</td></tr>')
+        disk_rows.append('<tr><td colspan="4">No disk information available.</td></tr>')
     failed_units = diagnostics.get("failed_units") or []
     unit_rows = []
     for unit in failed_units:
@@ -1293,7 +1410,83 @@ def generate_html_report(report, history=None):
         )
     if not unit_rows:
         unit_rows.append('<tr><td colspan="3">No failed units reported.</td></tr>')
+    # Network interfaces
+    network_rows = []
+    for interface in report.get("network", []):
+        net_rates = (report.get("network_io") or {}).get("interfaces", {}).get(interface.get("name"), {})
+        network_rows.append(
+            "<tr>"
+            f"<td>{esc(interface.get('name'))}</td>"
+            f"<td>{esc(interface.get('state'))}</td>"
+            f"<td>{esc(interface.get('mac_address'))}</td>"
+            f"<td>{esc(', '.join(interface.get('ipv4', [])) or 'N/A')}</td>"
+            f"<td>{esc(net_rates.get('rx_mbps', 0))} MB/s</td>"
+            f"<td>{esc(net_rates.get('tx_mbps', 0))} MB/s</td>"
+            "</tr>"
+        )
 
+    if not network_rows:
+        network_rows.append(
+            '<tr><td colspan="6">No network interfaces available.</td></tr>'
+        )
+
+    # Listening sockets
+    socket_data = report.get("listening_sockets") or {}
+    socket_rows = []
+
+    for item in socket_data.get("items", []):
+        socket_rows.append(
+            "<tr>"
+            f"<td>{esc(item.get('protocol'))}</td>"
+            f"<td>{esc(item.get('state'))}</td>"
+            f"<td>{esc(item.get('local_address'))}</td>"
+            f"<td>{esc(item.get('process') or 'Unknown')}</td>"
+            "</tr>"
+        )
+
+    if not socket_rows:
+        socket_rows.append(
+            '<tr><td colspan="4">No listening sockets available.</td></tr>'
+        )
+
+    # Services
+    service_rows = []
+    for name, service in (report.get("services") or {}).items():
+        service_status = (
+            service.get("status", "UNKNOWN")
+            if isinstance(service, dict)
+            else service
+        )
+
+        service_rows.append(
+            "<tr>"
+            f"<td>{esc(name)}</td>"
+            f"<td>{esc(service_status)}</td>"
+            "</tr>"
+        )
+
+    if not service_rows:
+        service_rows.append(
+            '<tr><td colspan="2">No service information available.</td></tr>'
+        )
+
+    # Top processes
+    process_rows = []
+    for process in report.get("top_processes", []):
+        process_rows.append(
+            "<tr>"
+            f"<td>{esc(process.get('pid'))}</td>"
+            f"<td>{esc(process.get('user', 'N/A'))}</td>"
+            f"<td>{esc(process.get('command', process.get('name')))}</td>"
+            f"<td>{esc(process.get('cpu_percent'))}%</td>"
+            f"<td>{esc(process.get('memory_percent'))}%</td>"
+            "</tr>"
+        )
+
+    if not process_rows:
+        process_rows.append(
+            '<tr><td colspan="5">No process information available.</td></tr>'
+        )
     def log_list(section):
         info = diagnostics.get(section) or {}
         messages = info.get("messages") or []
@@ -1304,7 +1497,11 @@ def generate_html_report(report, history=None):
         return "".join(f"<li>{esc(message)}</li>" for message in messages)
 
     history_rows = []
-    for item in (history or [])[-10:][::-1]:
+    valid_history = [
+        item for item in (history or [])
+        if isinstance(item, dict)
+    ]
+    for item in valid_history[-10:][::-1]:
         timestamp = item.get("timestamp_utc", "unknown")
         status = item.get("health", {}).get("status", "UNKNOWN")
         cpu = item.get("cpu", {}).get("usage_percent")
@@ -1332,291 +1529,366 @@ def generate_html_report(report, history=None):
 
     raw_json = esc(json.dumps(report, indent=2, ensure_ascii=False))
 
-    return f"""<!doctype html>
+    disk_values = [
+        item.get("usage_percent")
+        for item in disks
+        if item.get("monitored") is not False
+        and not (item.get("type") == "9p" and str(item.get("mountpoint", "")).startswith("/mnt/"))
+        and isinstance(item.get("usage_percent"), (int, float))
+    ]
+    disk_max = max(disk_values) if disk_values else None
+    memory = report.get("memory") or {}
+    cpu = report.get("cpu") or {}
+    network_count = len(report.get("network") or [])
+    uptime = system.get("uptime_seconds")
+    uptime_text = (
+        f"{uptime // 86400}d {(uptime % 86400) // 3600}h"
+        if isinstance(uptime, (int, float)) else "N/A"
+    )
+    os_name = (system.get("os") or {}).get("distribution", "Unknown")
+    kernel = (system.get("os") or {}).get("kernel", "Unknown")
+    load = system.get("load_average") or []
+    load_text = " · ".join(f"{value:.2f}" for value in load[:3]) or "N/A"
+
+    template = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Linux Server Health Dashboard</title>
+<meta name="theme-color" content="#0b1220">
+<title>Linux Server Health Monitor</title>
 <style>
-:root {{
+:root {
   color-scheme: dark;
-  font-family: Inter, "Segoe UI", system-ui, sans-serif;
-  background: #080d18;
-  color: #e8edf7;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  --surface: #101827;
-  --surface-raised: #151f31;
-  --border: #26344a;
-  --muted: #91a0b8;
-  --accent: #73a7ff;
-}}
-* {{ box-sizing: border-box; }}
-body {{
-  margin: 0;
-  background:
-    radial-gradient(ellipse at 12% 0%, #172541 0, transparent 38%),
-    #080d18;
-}}
-main {{ max-width: 1320px; margin: auto; padding: 32px 24px 48px; }}
-header {{
-  position: relative;
-  overflow: hidden;
-  padding: 32px;
-  border: 1px solid #2b3d59;
-  border-radius: 22px;
-  background: linear-gradient(120deg, #17263d, #101827 70%);
-  margin-bottom: 24px;
-  box-shadow: 0 16px 40px #00000020;
-}}
-header::after {{
-  content: "";
-  position: absolute;
-  width: 220px;
-  height: 220px;
-  right: -90px;
-  top: -100px;
-  border-radius: 50%;
-  background: #4d83e8;
-  opacity: .09;
-  filter: blur(8px);
-  pointer-events: none;
-}}
-header > * {{ position: relative; z-index: 1; }}
-header .muted:first-child {{
-  color: #8fb7ff;
-  font-size: .76rem;
-  font-weight: 750;
-  letter-spacing: .13em;
-}}
-h1 {{
-  margin: 10px 0 12px;
-  font-size: clamp(1.8rem, 4vw, 2.65rem);
-  letter-spacing: -.045em;
-  line-height: 1.15;
-}}
-h2 {{
-  font-size: 1rem;
-  letter-spacing: -.015em;
-  margin: 0 0 18px;
-}}
-p {{ line-height: 1.6; }}
-.muted {{ color: var(--muted); font-size: .85rem; }}
-.overview {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0 14px; }}
-.badge {{
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: .76rem;
-  font-weight: 750;
-  text-transform: uppercase;
-  letter-spacing: .025em;
-}}
-.good {{ background: #10352d; border-color: #1c5847; color: #78e0b7; }}
-.warning {{ background: #3c2d17; border-color: #725322; color: #ffd18a; }}
-.critical {{ background: #401f2a; border-color: #743344; color: #ff9cab; }}
-.neutral {{ background: #202c40; border-color: #35445c; color: #bdc9dc; }}
-.grid {{
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
-  gap: 14px;
-  margin-bottom: 8px;
-}}
-.card, section {{
-  background: linear-gradient(145deg, #121d2e, #0f1827);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 22px;
-  min-width: 0;
-  box-shadow: 0 8px 24px #00000012;
-}}
-section {{ margin-bottom: 18px; }}
-.metric {{
-  position: relative;
-  overflow: hidden;
-  padding: 20px;
-  transition: border-color .18s ease, transform .18s ease;
-}}
-.metric:hover {{
-  border-color: #425a7d;
-  transform: translateY(-2px);
-}}
-.metric-name {{
-  color: #aab9d0;
-  font-size: .82rem;
-  font-weight: 650;
-  overflow-wrap: anywhere;
-}}
-.metric-value {{
-  font-size: clamp(1.8rem, 3vw, 2.25rem);
-  font-weight: 780;
-  letter-spacing: -.045em;
-  margin: 12px 0;
-  font-variant-numeric: tabular-nums;
-}}
-.metric .badge {{ margin-bottom: 8px; }}
-.metric p {{ margin: 8px 0 0; }}
-.table-wrap {{ overflow-x: auto; border-radius: 10px; }}
-table {{ width: 100%; border-collapse: collapse; text-align: left; }}
-th, td {{
-  padding: 13px 14px;
-  border-bottom: 1px solid #253249;
-  vertical-align: top;
-  overflow-wrap: anywhere;
-}}
-th {{
-  color: #91a6c4;
-  font-size: .73rem;
-  font-weight: 750;
-  letter-spacing: .06em;
-  text-transform: uppercase;
-  background: #151f30;
-}}
-tbody tr {{ transition: background .15s ease; }}
-tbody tr:hover {{ background: #182438; }}
-tbody tr:last-child td {{ border-bottom: 0; }}
-ul {{ padding-left: 20px; }}
-li {{
-  margin: 9px 0;
-  padding-left: 3px;
-  color: #c6d0e0;
-  line-height: 1.55;
-  overflow-wrap: anywhere;
-}}
-li::marker {{ color: #759de0; }}
-details {{
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 15px 17px;
-  background: #0c1422;
-}}
-details summary {{
-  cursor: pointer;
-  font-weight: 700;
-  color: #c8d8f1;
-}}
-details summary:hover {{ color: #8fb7ff; }}
-pre {{
-  max-height: 520px;
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  padding: 16px;
-  border-radius: 10px;
-  background: #080e18;
-  border: 1px solid #26344a;
-  color: #b9cbe5;
-  font-size: .78rem;
-  line-height: 1.6;
-}}
-.progress-track {{
-  height: 7px;
-  margin: 14px 0;
-  overflow: hidden;
-  border-radius: 999px;
-  background: #26344a;
-}}
-.progress-fill {{
-  height: 100%;
-  border-radius: inherit;
-  transition: width .25s ease;
-}}
-.progress-fill.good {{ background: #42d6a0; }}
-.progress-fill.warning {{ background: #f4b74f; }}
-.progress-fill.critical {{ background: #ff7185; }}
-.progress-fill.neutral {{ background: #7798c9; }}footer {{ color: #71829d; text-align: center; padding-top: 20px; font-size: .8rem; }}
-@media (max-width: 640px) {{
-  main {{ padding: 16px 12px 32px; }}
-  header {{ padding: 23px 19px; border-radius: 16px; }}
-  .card, section {{ padding: 17px; }}
-  .metric {{ padding: 17px; }}
-  th, td {{ padding: 10px; }}
-}}
-@media (prefers-reduced-motion: reduce) {{
-  *, *::before, *::after {{ transition: none !important; }}
-}}
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #0b1220; color: #e6edf7;
+  --bg:#0b1220; --panel:#111c2d; --panel2:#162338; --line:#263750;
+  --muted:#91a2bb; --text:#e6edf7; --blue:#4f9cff; --cyan:#39c6e8;
+  --green:#35d39a; --yellow:#f4b84e; --red:#ff647c; --purple:#a78bfa;
+}
+* {box-sizing:border-box}
+html {scroll-behavior:smooth}
+body {margin:0;background:var(--bg);color:var(--text)}
+button,select {font:inherit}
+a {color:inherit;text-decoration:none}
+.app {min-height:100vh}
+.sidebar {
+ position:fixed;inset:0 auto 0 0;width:238px;padding:25px 16px;
+ background:#0e1929;border-right:1px solid #223149;display:flex;flex-direction:column;z-index:20
+}
+.brand {display:flex;align-items:center;gap:11px;padding:2px 9px 28px}
+.brand-mark {width:38px;height:38px;border-radius:12px;display:grid;place-items:center;
+ background:linear-gradient(135deg,#2878e8,#35c8d9);font-weight:900;color:white;font-size:19px}
+.brand-name {font-size:14px;font-weight:800;letter-spacing:.02em}
+.brand-sub {font-size:10px;color:var(--muted);margin-top:3px;letter-spacing:.12em}
+.nav-label {font-size:10px;font-weight:800;letter-spacing:.15em;color:#687c98;padding:13px 11px 9px}
+.nav {display:grid;gap:5px}
+.nav a {display:flex;align-items:center;gap:12px;padding:11px 12px;border-radius:9px;
+ color:#9eafc6;font-size:13px;transition:.15s}
+.nav a:hover,.nav a.active {background:#192b43;color:#f4f8ff}
+.nav a.active {box-shadow:inset 3px 0 var(--blue)}
+.nav-icon {width:18px;text-align:center;color:#7faef2;font-size:15px}
+.sidebar-footer {margin-top:auto;padding:15px 10px;border-top:1px solid #223149;color:#71849e;font-size:11px;line-height:1.7}
+.main {margin-left:238px;padding:27px 32px 45px;max-width:1800px}
+.topbar {display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:23px}
+.eyebrow {font-size:10px;color:#7eaef0;letter-spacing:.16em;font-weight:800}
+h1 {font-size:25px;letter-spacing:-.04em;margin:6px 0 0}
+.top-actions {display:flex;align-items:center;gap:10px}
+.live-pill {display:inline-flex;align-items:center;gap:8px;border:1px solid #245d4d;background:#102c28;
+ color:#5ee0ae;border-radius:30px;padding:8px 12px;font-size:11px;font-weight:800}
+.live-dot {width:7px;height:7px;border-radius:50%;background:#35d39a;box-shadow:0 0 10px #35d39a}
+.control {background:#142239;color:#dce8f8;border:1px solid #2b405d;border-radius:8px;padding:9px 12px;font-size:11px}
+.panel {background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:19px;min-width:0}
+.server-overview {display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:17px;
+ background:linear-gradient(110deg,#142640,#111c2d 72%);border-color:#2b4566}
+.server-id {display:flex;align-items:center;gap:14px}
+.server-icon {width:46px;height:46px;display:grid;place-items:center;border-radius:12px;background:#1d3858;color:#72b5ff;font-size:21px}
+.server-id h2 {font-size:16px;margin:0 0 5px}
+.server-meta {font-size:11px;color:var(--muted);line-height:1.7}
+.health-state {text-align:right}
+.health-state .state {font-size:19px;font-weight:850;letter-spacing:.02em}
+.health-state small {display:block;color:var(--muted);font-size:10px;margin-top:5px}
+.state.good {color:var(--green)} .state.warning {color:var(--yellow)} .state.critical {color:var(--red)} .state.neutral {color:#9fb0c7}
+.kpi-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:17px}
+.kpi {position:relative;overflow:hidden;padding:17px 18px}
+.kpi-top {display:flex;align-items:center;justify-content:space-between;color:#a6b6cc;font-size:11px;font-weight:650}
+.kpi-icon {width:30px;height:30px;display:grid;place-items:center;border-radius:9px;background:#1b3452;color:#78b6ff;font-size:14px}
+.kpi-value {font-size:27px;font-weight:800;letter-spacing:-.05em;margin:13px 0 5px;font-variant-numeric:tabular-nums}
+.kpi-foot {font-size:10px;color:var(--muted)}
+.kpi-bar {height:4px;background:#263750;border-radius:9px;margin-top:13px;overflow:hidden}
+.kpi-bar span {display:block;height:100%;border-radius:9px;background:var(--blue)}
+.kpi:nth-child(2) .kpi-bar span {background:var(--purple)}
+.kpi:nth-child(3) .kpi-bar span {background:var(--yellow)}
+.kpi:nth-child(4) .kpi-bar span {background:var(--cyan)}
+.section-head {display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:15px}
+.section-head h2 {font-size:14px;margin:0;font-weight:750}
+.section-note {font-size:10px;color:var(--muted)}
+.chart-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.chart-card {padding:17px}
+.chart-card h3 {font-size:12px;margin:0 0 15px;color:#d8e4f4}
+.chart-card canvas {display:block;width:100%;height:170px}
+.summary-grid {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-top:14px}
+.summary-card {padding:13px}
+.summary-card span {font-size:10px;color:var(--muted)}
+.summary-card strong {display:block;font-size:17px;margin-top:8px;font-variant-numeric:tabular-nums}
+.summary-card small {display:block;font-size:9px;color:#71849e;margin-top:4px}
+.two-col {display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:17px}
+.table-wrap {overflow-x:auto}
+table {width:100%;border-collapse:collapse;text-align:left;white-space:nowrap}
+th {font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:#8ea4c2;font-weight:800;background:#16243a}
+th,td {padding:11px 12px;border-bottom:1px solid #223149;font-size:11px}
+td {color:#d0dbea}
+tbody tr:hover {background:#17273d}
+tbody tr:last-child td {border-bottom:0}
+.badge {display:inline-flex;align-items:center;border-radius:20px;padding:4px 8px;font-size:9px;font-weight:800;text-transform:uppercase}
+.badge.good {background:#12372f;color:#5fe0ad}.badge.warning {background:#3b301b;color:#ffd078}
+.badge.critical {background:#40202b;color:#ff8295}.badge.neutral {background:#243249;color:#b7c5d9}
+.lower-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:17px}
+.compact-section {margin-top:14px}
+details summary {cursor:pointer;color:#b9cbe3;font-size:12px;font-weight:750}
+details pre {max-height:480px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#0a1220;border:1px solid #253650;border-radius:8px;padding:14px;color:#a9bdd8;font-size:10px;line-height:1.6}
+.log-list {padding-left:17px;margin:0;color:#b8c8dc;font-size:11px;line-height:1.7}
+.muted {color:var(--muted)}
+#resource-health-details .grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.metric.card {background:#142239;border:1px solid #293d58;border-radius:10px;padding:14px}
+.metric-name {font-size:10px;color:#a8bad2}.metric-value {font-size:20px;font-weight:800;margin:9px 0}
+.progress-track {height:5px;background:#293b54;border-radius:8px;overflow:hidden;margin:9px 0}
+.progress-fill {height:100%;border-radius:8px}.progress-fill.good{background:var(--green)}.progress-fill.warning{background:var(--yellow)}.progress-fill.critical{background:var(--red)}.progress-fill.neutral{background:var(--blue)}
+.metric p {font-size:9px;color:var(--muted)}.metric .badge{margin-top:4px}
+footer {padding:22px 0;text-align:center;color:#647894;font-size:10px}
+@media(max-width:1200px){.main{padding:22px}.kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-grid{grid-template-columns:1fr 1fr}.summary-grid{grid-template-columns:repeat(3,1fr)}}
+.network-chart-grid{grid-template-columns:minmax(0,1.6fr) minmax(260px,1fr);margin:12px 0 16px}.network-stats-card{min-width:0}.network-stat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px}.network-stat-grid div{display:flex;flex-direction:column;gap:7px;padding:12px;border:1px solid #263b56;border-radius:10px;background:#101d30}.network-stat-grid small{font-size:9px;color:#8fb9e9;letter-spacing:.04em}.network-stat-grid strong{font-size:16px;color:#f4f8ff}@media(max-width:850px){.network-chart-grid{grid-template-columns:1fr}}\n@media(max-width:850px){.sidebar{width:66px;padding:18px 9px}.brand{padding:0 4px 25px}.brand-name,.brand-sub,.nav-label,.nav a span:last-child,.sidebar-footer{display:none}.brand-mark{width:42px}.nav a{justify-content:center;padding:12px 5px}.nav-icon{font-size:17px}.main{margin-left:66px;padding:20px 16px}.two-col,.lower-grid{grid-template-columns:1fr}}
+@media(max-width:600px){.main{padding:16px 11px}.topbar{align-items:flex-start}.top-actions{flex-wrap:wrap;justify-content:flex-end}.topbar h1{font-size:20px}.server-overview{align-items:flex-start}.health-state .state{font-size:15px}.kpi-grid{gap:9px}.kpi{padding:13px}.kpi-value{font-size:22px}.chart-grid{grid-template-columns:1fr}.summary-grid{grid-template-columns:repeat(2,1fr)}.server-meta{font-size:10px}}
+
+
+.filter-row{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}.filter-input{min-width:220px;flex:1}.extended-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:14px}.extended-card{padding:14px 16px}.extended-card small{display:block;color:#89a6ca;font-size:9px;letter-spacing:.6px}.extended-card strong{display:block;font-size:19px;margin:8px 0 4px}.extended-card span{color:#849bb8;font-size:10px}.settings-form{display:grid;gap:14px}.service-settings{display:flex;gap:18px;flex-wrap:wrap;border:1px solid #263750;border-radius:10px;padding:12px}.service-settings legend{color:#89a6ca;font-size:9px;letter-spacing:.6px}.service-settings label{display:flex;align-items:center;gap:7px;color:#dce8f8;font-size:11px}.settings-form label{display:grid;gap:7px}.settings-form input{width:100%}.exclude-label textarea{width:100%;resize:vertical}.settings-actions{display:flex;align-items:center;gap:12px}.primary-control{background:#1d4c7c;border-color:#397fc2;color:#fff;cursor:pointer}.control{cursor:pointer}.history-time{font-variant-numeric:tabular-nums}.command-cell{max-width:260px;overflow:hidden;text-overflow:ellipsis}.table-wrap{scrollbar-width:thin}@media(max-width:900px){.extended-grid{grid-template-columns:1fr 1fr}}@media(max-width:600px){.extended-grid{grid-template-columns:1fr}}
+
+/* Reference-dashboard refinements */
+.nav-label{font-size:10px;letter-spacing:1.5px;color:#7086a6;font-weight:800;padding:12px 10px 8px}
+.nav-icon svg,.kpi-icon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.nav-icon{display:grid;place-items:center;width:20px;height:20px;color:#66aaff;flex:none}
+.nav a{gap:13px}.kpi-icon{display:grid;place-items:center}.kpi-foot{line-height:1.6}.kpi-foot span{color:#829bbd;font-size:10px}
+.quick-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:14px 0}
+.quick-stat{display:flex;align-items:center;gap:12px;padding:13px 14px;min-height:70px}
+.quick-stat small,.settings-grid small{display:block;color:#89a6ca;font-size:9px;letter-spacing:.5px;margin-bottom:6px}
+.quick-stat strong{font-size:15px;color:#f2f6ff}.quick-icon{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;flex:none;background:#172a43;font-size:20px}
+.quick-icon svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.brand-mark svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.quick-icon.green{color:#39df91}.quick-icon.cyan{color:#2fc7f4}.quick-icon.purple{color:#a78bfa}.quick-icon.red{color:#ff596b}.quick-icon.blue{color:#36b8ff}
+.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.settings-grid>div{background:#101d30;border:1px solid #243750;border-radius:10px;padding:14px}.settings-grid strong{font-size:13px}.settings-grid p{font-size:10px;color:#849bb8;margin:7px 0 0}
+@media(max-width:1100px){.quick-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:650px){.quick-stats,.settings-grid{grid-template-columns:1fr}}
+
+/* ServerPulse multi-page navigation */
+body[data-page] .main > .server-overview,
+body[data-page] .main > .kpi-grid,
+body[data-page] .main > .two-col,
+body[data-page] .main > .quick-stats,
+body[data-page] .main > .extended-grid,
+body[data-page] .main > .lower-grid,
+body[data-page] .main > #performance,
+body[data-page] .main > #metrics-detail,
+body[data-page] .main > #failed-units,
+body[data-page] .main > #history,
+body[data-page] .main > #logs,
+body[data-page] .main > #resource-health-details,
+body[data-page] .main > #settings,
+body[data-page] .main > #json-report {display:none!important}
+body[data-page="dashboard"] .main > .server-overview{display:flex!important}
+body[data-page="dashboard"] .main > .kpi-grid,
+body[data-page="dashboard"] .main > .quick-stats,
+body[data-page="dashboard"] .main > .extended-grid{display:grid!important}
+body[data-page="dashboard"] .main > #performance{display:block!important}
+body[data-page="dashboard"] .main > .two-col{display:grid!important}
+body[data-page="metrics"] .main > #performance,
+body[data-page="metrics"] .main > #metrics-detail,
+body[data-page="metrics"] .main > #resource-health-details{display:block!important}
+body[data-page="metrics"] .main > .extended-grid{display:grid!important}
+body[data-page="alerts"] .main > .two-col,
+body[data-page="processes"] .main > .two-col{display:grid!important;grid-template-columns:minmax(0,1fr)!important}
+body[data-page="alerts"] #alerts, body[data-page="processes"] #processes{display:block!important}
+body[data-page="alerts"] #processes, body[data-page="processes"] #alerts{display:none!important}
+body[data-page="disks"] .main > .lower-grid,
+body[data-page="network"] .main > .lower-grid{display:grid!important;grid-template-columns:minmax(0,1fr)!important}
+body[data-page="disks"] #disks, body[data-page="network"] #network{display:block!important}
+body[data-page="disks"] #network, body[data-page="disks"] #services, body[data-page="disks"] #sockets,
+body[data-page="network"] #disks, body[data-page="network"] #services, body[data-page="network"] #sockets{display:none!important}
+body[data-page="services"] .main > .lower-grid{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important}
+body[data-page="services"] #services, body[data-page="services"] #sockets, body[data-page="services"] #failed-units{display:block!important}
+body[data-page="services"] #disks, body[data-page="services"] #network{display:none!important}
+body[data-page="logs"] .main > #logs,
+body[data-page="history"] .main > #history,
+body[data-page="settings"] .main > #settings,
+body[data-page="settings"] .main > #json-report{display:block!important}
+body[data-page="settings"] .main > #resource-health-details{display:block!important}
+body[data-page] .main > footer{display:block}
+.nav a.active{background:#1a2d46;border-left:3px solid #4a9cff;color:#fff}
+#metrics-detail .metrics-detail-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media(max-width:850px){#metrics-detail .metrics-detail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){#metrics-detail .metrics-detail-grid{grid-template-columns:1fr}body[data-page="services"] .main > .lower-grid{grid-template-columns:1fr!important}}
 </style>
 </head>
 <body>
-<main>
-<header>
-  <p class="muted">LINUX SERVER HEALTH MONITOR · VERSION {esc(report.get("monitor_version", "unknown"))}</p>
-  <h1>Server Health Dashboard</h1>
-  <p>Host: <strong>{esc(hostname)}</strong></p>
-  <div class="overview">
-    <span class="badge {status_class(resource_status)}">Resource health: {esc(resource_status)}</span>
-    <span class="badge {status_class(systemd_status)}">Systemd status: {esc(systemd_status)}</span>
+<div class="app">
+<aside class="sidebar">
+  <div class="brand"><div class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-6 4 12 3-6h4"/></svg></div><div><div class="brand-name">SERVERPULSE</div><div class="brand-sub">LINUX MONITOR</div></div></div>
+  <nav class="nav" aria-label="Main navigation">
+    <div class="nav-label">MONITORING</div>
+    <a class="active" href="#dashboard" data-page="dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>Dashboard</a>
+    <a href="#metrics" data-page="metrics"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span>Metrics</a>
+    <a href="#alerts" data-page="alerts"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg></span>Alerts</a>
+    <a href="#disks" data-page="disks"><span class="nav-icon"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></span>Disks</a>
+    <a href="#network" data-page="network"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="m10.5 7.5-4 7.5m7-7.5 4 7.5M8 18h8"/></svg></span>Network</a>
+    <a href="#services" data-page="services"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2m0-14-2 2M7 17l-2 2"/></svg></span>Services</a>
+    <a href="#processes" data-page="processes"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8h8v8H8zM9 1v3m6-3v3M9 20v3m6-3v3"/></svg></span>Processes</a>
+    <a href="#logs" data-page="logs"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 5h14M5 12h14M5 19h14"/></svg></span>Logs</a>
+    <a href="#history" data-page="history"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>History</a>
+    <a href="#settings" data-page="settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg></span>Settings</a>
+  </nav>
+  <div class="sidebar-footer">LINUX SERVER HEALTH MONITOR<br>Version __VERSION__<br>Local monitoring instance</div>
+</aside>
+<main class="main" id="dashboard">
+  <div class="topbar">
+    <div><div class="eyebrow">INFRASTRUCTURE / OVERVIEW</div><h1 id="page-title">Server Health Dashboard</h1></div>
+    <div class="top-actions"><span class="live-pill" id="live-monitor-status"><span class="live-dot"></span> LIVE · CONNECTING</span><select class="control" id="chart-range"><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="60" selected>1 hour</option></select></div>
   </div>
-  <p class="muted">Generated: {esc(generated)}</p>
-</header>
 
-<section>
-  <h2>Resource health checks</h2>
-  <div class="grid">{''.join(cards)}</div>
-</section>
+  <section class="panel server-overview">
+    <div class="server-id"><div class="server-icon">▣</div><div><h2 id="server-hostname">__HOSTNAME__</h2><div class="server-meta" id="server-meta">__OS__ · Kernel __KERNEL__<br>Uptime: __UPTIME__ · Load: __LOAD__</div></div></div>
+    <div class="health-state"><div class="state __HEALTH_CLASS__" id="overall-health">__HEALTH__</div><small>OVERALL SYSTEM HEALTH</small><div class="muted" style="font-size:10px;margin-top:7px"><!-- Systemd status: degraded -->Systemd status: <span id="systemd-status">__SYSTEMD__</span></div></div>
+  </section>
 
-<<section>
-  <h2>Recent Health History</h2>
-  <div class="table-wrap">
-  <table>
-    <thead>
-      <tr>
-        <th>Timestamp (UTC)</th>
-        <th>Status</th>
-        <th>CPU</th>
-        <th>RAM</th>
-      </tr>
-    </thead>
-    <tbody>{''.join(history_rows)}</tbody>
-  </table>
+  <section class="kpi-grid" aria-label="Key metrics">
+    <article class="panel kpi"><div class="kpi-top"><span>CPU UTILIZATION</span><span class="kpi-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span></div><div class="kpi-value" id="kpi-cpu">__CPU__</div><div class="kpi-foot">Processor usage · <span id="cpu-thresholds">Warning ≥ 80% · Critical ≥ 95%</span></div><div class="kpi-bar"><span id="bar-cpu" style="width:__CPU_BAR__%"></span></div></article>
+    <article class="panel kpi"><div class="kpi-top"><span>MEMORY USAGE</span><span class="kpi-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8h8v8H8z"/></svg></span></div><div class="kpi-value" id="kpi-memory">__MEMORY__</div><div class="kpi-foot">RAM consumption · <span id="memory-thresholds">Warning ≥ 80% · Critical ≥ 95%</span></div><div class="kpi-bar"><span id="bar-memory" style="width:__MEMORY_BAR__%"></span></div></article>
+    <article class="panel kpi"><div class="kpi-top"><span>DISK UTILIZATION</span><span class="kpi-icon"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/></svg></span></div><div class="kpi-value" id="kpi-disk">__DISK__</div><div class="kpi-foot">Highest mounted filesystem · <span id="disk-thresholds">Warning ≥ 80% · Critical ≥ 95%</span></div><div class="kpi-bar"><span id="bar-disk" style="width:__DISK_BAR__%"></span></div></article>
+    <article class="panel kpi"><div class="kpi-top"><span>NETWORK THROUGHPUT</span><span class="kpi-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="m10.5 7.5-4 7.5m7-7.5 4 7.5M8 18h8"/></svg></span></div><div class="kpi-value" id="kpi-network">__NETWORK_COUNT__</div><div class="kpi-foot" id="network-kpi-foot">↓ Download · ↑ Upload</div><div class="kpi-bar"><span id="bar-network" style="width:__NETWORK_BAR__%"></span></div></article>
+  </section>
+
+
+  <section class="panel" id="performance">
+    <div class="section-head"><h2>Performance Analytics</h2><span class="section-note">Historical telemetry · auto refresh every 5 seconds</span></div>
+    <div class="chart-grid">
+      <article class="panel chart-card"><h3>CPU Usage</h3><canvas id="cpu-chart" height="170"></canvas></article>
+      <article class="panel chart-card"><h3>Memory Usage</h3><canvas id="memory-chart" height="170"></canvas></article>
+      <article class="panel chart-card"><h3>Disk I/O Throughput</h3><canvas id="disk-io-chart" height="170"></canvas></article>
+    </div>
+    <div class="summary-grid">
+      <div class="panel summary-card"><span>AVERAGE CPU</span><strong id="summary-avg-cpu">--</strong></div>
+      <div class="panel summary-card"><span>PEAK CPU</span><strong id="summary-peak-cpu">--</strong><small id="summary-peak-cpu-time">No data</small></div>
+      <div class="panel summary-card"><span>AVERAGE MEMORY</span><strong id="summary-avg-memory">--</strong></div>
+      <div class="panel summary-card"><span>PEAK MEMORY</span><strong id="summary-peak-memory">--</strong><small id="summary-peak-memory-time">No data</small></div>
+      <div class="panel summary-card"><span>MAX DISK READ</span><strong id="summary-max-read">--</strong><small id="summary-max-read-time">No data</small></div>
+      <div class="panel summary-card"><span>MAX DISK WRITE</span><strong id="summary-max-write">--</strong><small id="summary-max-write-time">No data</small></div>
+    </div>
+  </section>
+
+  <section class="panel compact-section" id="metrics-detail">
+    <div class="section-head"><h2>Resource Metrics Detail</h2><span class="section-note">Live values from the latest collection cycle</span></div>
+    <div class="extended-grid metrics-detail-grid">
+      <article class="panel extended-card"><small>CPU IOWAIT</small><strong id="metrics-iowait">N/A</strong><span>CPU time waiting for storage I/O</span></article>
+      <article class="panel extended-card"><small>RAM USED</small><strong id="metrics-ram-used">N/A</strong><span id="metrics-ram-total">Total memory: N/A</span></article>
+      <article class="panel extended-card"><small>SWAP USED</small><strong id="metrics-swap-used">N/A</strong><span id="metrics-swap-total">Total swap: N/A</span></article>
+      <article class="panel extended-card"><small>ACTIVE CONNECTIONS</small><strong id="metrics-connections">N/A</strong><span>Current network connections</span></article>
+    </div>
+    <div class="section-head" style="margin-top:18px"><h2>Disk I/O by Device</h2><span class="section-note">Read/write throughput and operation counters</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Device</th><th>Read</th><th>Write</th><th>Read Ops/s</th><th>Write Ops/s</th></tr></thead><tbody id="disk-io-device-body"><tr><td colspan="5">Waiting for metrics…</td></tr></tbody></table></div>
+  </section>
+
+  <div class="two-col">
+    <section class="panel" id="alerts"><div class="section-head"><h2>Recent Alerts</h2><span class="section-note" id="alerts-summary">Loading events...</span></div><div class="filter-row"><input class="control filter-input" id="alert-search" type="search" placeholder="Search resource or message"><select class="control" id="alert-severity"><option value="ALL">All severities</option><option value="CRITICAL">Critical</option><option value="WARNING">Warning</option><option value="RECOVERED">Recovered</option></select><button class="control" id="export-alerts">Export CSV</button></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Severity</th><th>Resource</th><th>Value</th><th>Threshold</th><th>Event</th></tr></thead><tbody id="alerts-table-body"><tr><td colspan="6">No alerts yet.</td></tr></tbody></table></div></section>
+    <section class="panel" id="processes"><div class="section-head"><h2>Top Processes</h2><span class="section-note">Sorted by CPU usage</span></div><div class="table-wrap"><table><thead><tr><th>PID</th><th>User</th><th>Command</th><th>CPU</th><th>Memory</th></tr></thead><tbody id="process-table-body">__PROCESS_ROWS__</tbody></table></div></section>
   </div>
-</section>
-<section>
-  <h2>Disk usage</h2>
-  <div class="table-wrap">
-  <table>
-    <thead><tr><th>Mount point</th><th>Used</th><th>Filesystem</th></tr></thead>
-    <tbody>{''.join(disk_rows)}</tbody>
-  </table>
+
+  <section class="quick-stats" aria-label="System status summary">
+    <article class="panel quick-stat"><span class="quick-icon green"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 7v5l4 2M16 3h5v5"/></svg></span><div><small>LOAD AVERAGE</small><strong id="quick-load">__LOAD__</strong></div></article>
+    <article class="panel quick-stat"><span class="quick-icon cyan"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="m10.5 7.5-4 7.5m7-7.5 4 7.5M8 18h8"/></svg></span><div><small>ACTIVE CONNECTIONS</small><strong id="quick-connections">__CONNECTIONS__</strong></div></article>
+    <article class="panel quick-stat"><span class="quick-icon purple"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></span><div><small>LISTENING SOCKETS</small><strong id="quick-sockets">__SOCKETS__</strong></div></article>
+    <article class="panel quick-stat"><span class="quick-icon red"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6m0-6-6 6"/></svg></span><div><small>FAILED UNITS</small><strong id="quick-failed">__FAILED__</strong></div></article>
+    <article class="panel quick-stat"><span class="quick-icon blue"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 10h18"/></svg></span><div><small>REPORT GENERATED</small><strong id="quick-generated">__GENERATED__</strong></div></article>
+  </section>
+
+  <section class="extended-grid" aria-label="Extended telemetry">
+    <article class="panel extended-card"><small>CPU IOWAIT</small><strong id="extended-iowait">N/A</strong><span>Time waiting for storage I/O</span></article>
+    <article class="panel extended-card"><small>SWAP USAGE</small><strong id="extended-swap">N/A</strong><span id="extended-swap-detail">Swap consumption</span></article>
+    <article class="panel extended-card"><small>ROOT FREE SPACE</small><strong id="extended-root-free">N/A</strong><span>Available on / filesystem</span></article>
+  </section>
+
+  <div class="lower-grid">
+    <section class="panel" id="disks"><div class="section-head"><h2>Disk Usage</h2></div><div class="table-wrap"><table><thead><tr><th>Mount point</th><th>Used</th><th>Filesystem</th><th>Monitoring</th></tr></thead><tbody id="disk-table-body">__DISK_ROWS__</tbody></table></div></section>
+    <section class="panel" id="network">
+      <div class="section-head"><h2>Network Monitoring</h2><span class="section-note">Live throughput · cumulative interface counters</span></div>
+      <div class="chart-grid network-chart-grid">
+        <article class="panel chart-card"><h3>Network Traffic · RX / TX (MB/s)</h3><canvas id="network-io-chart" height="170"></canvas></article>
+        <article class="panel chart-card network-stats-card">
+          <h3>Traffic Statistics</h3>
+          <div class="network-stat-grid">
+            <div><small>TOTAL RECEIVED</small><strong id="network-total-rx">--</strong></div>
+            <div><small>TOTAL SENT</small><strong id="network-total-tx">--</strong></div>
+            <div><small>PEAK DOWNLOAD</small><strong id="network-peak-rx">--</strong></div>
+            <div><small>PEAK UPLOAD</small><strong id="network-peak-tx">--</strong></div>
+          </div>
+        </article>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>Interface</th><th>State</th><th>MAC</th><th>IPv4</th><th>RX Rate</th><th>TX Rate</th><th>Total RX</th><th>Total TX</th></tr></thead><tbody id="network-table-body">__NETWORK_ROWS__</tbody></table></div>
+    </section>
+    <section class="panel" id="services"><div class="section-head"><h2>Services Status</h2></div><div class="table-wrap"><table><thead><tr><th>Service</th><th>Status</th></tr></thead><tbody id="service-table-body">__SERVICE_ROWS__</tbody></table></div></section>
+    <section class="panel" id="sockets"><div class="section-head"><h2>Listening Sockets</h2><span class="section-note">TCP / UDP</span></div><div class="table-wrap"><table><thead><tr><th>Protocol</th><th>State</th><th>Local Address</th><th>Process</th></tr></thead><tbody id="socket-table-body">__SOCKET_ROWS__</tbody></table></div></section>
   </div>
-</section>
 
-<section>
-  <h2>Failed systemd units</h2>
-  <div class="table-wrap">
-  <table>
-    <thead><tr><th>Unit</th><th>State</th><th>Description</th></tr></thead>
-    <tbody>{''.join(unit_rows)}</tbody>
-  </table>
-  </div>
-</section>
-
-<section>
-  <h2>Recent errors</h2>
-  <ul>{log_list("errors")}</ul>
-</section>
-
-<section>
-  <h2>Recent warnings</h2>
-  <ul>{log_list("warnings")}</ul>
-</section>
-
-<section>
-  <details>
-    <summary>View complete JSON report</summary>
-    <pre>{raw_json}</pre>
-  </details>
-</section>
-
-<footer>Generated locally by Linux Server Health Monitor.</footer>
+  <section class="panel compact-section" id="failed-units"><div class="section-head"><h2>Failed systemd Units</h2><span class="section-note">System diagnostics</span></div><div class="table-wrap"><table><thead><tr><th>Unit</th><th>State</th><th>Description</th></tr></thead><tbody id="failed-units-table-body">__UNIT_ROWS__</tbody></table></div></section>
+  <section class="panel compact-section" id="history"><div class="section-head"><h2>Recent Health History</h2><span class="section-note">Latest health reports</span></div><div class="table-wrap"><table><thead><tr><th>Timestamp (UTC)</th><th>Status</th><th>CPU</th><th>RAM</th></tr></thead><tbody id="history-table-body">__HISTORY_ROWS__</tbody></table></div><div class="section-head" style="margin-top:12px"><span class="section-note" id="history-summary">Latest reports</span><button class="control" id="export-history">Export CSV</button></div></section>
+  <section class="panel compact-section" id="logs"><div class="section-head"><h2>System Logs</h2></div><div class="lower-grid" style="margin-top:0"><div><h3 style="font-size:11px;color:#ff9aaa">Recent errors</h3><ul class="log-list">__ERRORS__</ul></div><div><h3 style="font-size:11px;color:#ffd078">Recent warnings</h3><ul class="log-list">__WARNINGS__</ul></div></div></section>
+  <section class="panel compact-section" id="resource-health-details"><div class="section-head"><h2>Resource health: __HEALTH__</h2></div><details><summary>Resource health checks · thresholds and status</summary><div class="grid" style="margin-top:15px">__HEALTH_CARDS__</div></details></section>
+  <section class="panel compact-section" id="settings"><div class="section-head"><h2>Dashboard Settings</h2><span class="section-note">Editable monitoring thresholds and exclusions</span></div><form id="settings-form" class="settings-form"><div class="settings-grid"><label><small>CPU WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-cpu-warning" required></label><label><small>CPU CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-cpu-critical" required></label><label><small>MEMORY WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-memory-warning" required></label><label><small>MEMORY CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-memory-critical" required></label><label><small>DISK WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-disk-warning" required></label><label><small>DISK CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-disk-critical" required></label></div><label class="exclude-label"><small>EXCLUDED MOUNT POINTS (ONE PER LINE)</small><textarea class="control" id="setting-excluded-mounts" rows="3" placeholder="/mnt/c&#10;/mnt/d"></textarea></label><fieldset class="service-settings"><legend>MONITORED SERVICES</legend><label><input type="checkbox" id="setting-service-ssh"> SSH</label><label><input type="checkbox" id="setting-service-sshd"> SSHD</label><label><input type="checkbox" id="setting-service-docker"> Docker</label><label><input type="checkbox" id="setting-service-nginx"> Nginx</label></fieldset><div class="settings-actions"><button class="control primary-control" type="submit">Save settings</button><span id="settings-status" class="section-note" role="status">Loading settings…</span></div></form></section>
+  <section class="panel compact-section" id="json-report"><details><summary>View complete JSON report</summary><pre>__RAW_JSON__</pre></details></section>
+  <footer>Linux Server Health Monitor · Version __VERSION__ · Generated __GENERATED__</footer>
 </main>
+</div>
 </body>
-</html>
-"""
+</html>"""
+
+    cpu_value = cpu.get("usage_percent")
+    memory_value = memory.get("usage_percent")
+    def percent_text(value):
+        return f"{value:.1f}%" if isinstance(value, (int, float)) else "N/A"
+    def bar_width(value):
+        return f"{max(0, min(100, float(value))):.1f}" if isinstance(value, (int, float)) else "0"
+    replacements = {
+        "__VERSION__": esc(report.get("monitor_version", "unknown")),
+        "__HOSTNAME__": esc(hostname),
+        "__OS__": esc(os_name),
+        "__KERNEL__": esc(kernel),
+        "__UPTIME__": esc(uptime_text),
+        "__LOAD__": esc(load_text),
+        "__HEALTH__": esc(resource_status.upper()),
+        "__HEALTH_CLASS__": status_class(resource_status),
+        "__SYSTEMD__": esc(systemd_status),
+        "__CPU__": percent_text(cpu_value),
+        "__CPU_BAR__": bar_width(cpu_value),
+        "__MEMORY__": percent_text(memory_value),
+        "__MEMORY_BAR__": bar_width(memory_value),
+        "__DISK__": percent_text(disk_max),
+        "__DISK_BAR__": bar_width(disk_max),
+        "__NETWORK_COUNT__": str(network_count),
+        "__NETWORK_BAR__": str(min(100, network_count * 10)),
+        "__CONNECTIONS__": esc(str(report.get("active_connections", "N/A"))),
+        "__SOCKETS__": esc(str((report.get("listening_sockets") or {}).get("count", 0))),
+        "__FAILED__": esc(str(len((report.get("system_diagnostics") or {}).get("failed_units") or []))),
+        "__PROCESS_ROWS__": "".join(process_rows),
+        "__DISK_ROWS__": "".join(disk_rows),
+        "__NETWORK_ROWS__": "".join(network_rows),
+        "__SERVICE_ROWS__": "".join(service_rows),
+        "__SOCKET_ROWS__": "".join(socket_rows),
+        "__UNIT_ROWS__": "".join(unit_rows),
+        "__HISTORY_ROWS__": "".join(history_rows),
+        "__ERRORS__": log_list("errors"),
+        "__WARNINGS__": log_list("warnings"),
+        "__HEALTH_CARDS__": "".join(cards),
+        "__RAW_JSON__": raw_json,
+        "__GENERATED__": esc(generated),
+    }
+    for marker, value in replacements.items():
+        template = template.replace(marker, value)
+    return template
+
 
 
 def watch_health(logger, interval):

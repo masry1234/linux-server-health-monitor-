@@ -1,4 +1,5 @@
 
+import io
 import json
 import logging
 import tempfile
@@ -785,3 +786,56 @@ class DiskIOHealthTests(unittest.TestCase):
         }
 
         self.assertEqual(checks["disk_io"], "UNKNOWN")
+
+
+class NetworkIOMetricsTests(unittest.TestCase):
+    def setUp(self):
+        health_monitor._network_previous = {}
+        health_monitor._network_previous_time = None
+
+    def tearDown(self):
+        health_monitor._network_previous = {}
+        health_monitor._network_previous_time = None
+
+    @staticmethod
+    def proc_net_dev(rx_bytes, tx_bytes):
+        return (
+            "Inter-| Receive | Transmit\n"
+            " face |bytes packets errs drop fifo frame compressed multicast|"
+            "bytes packets errs drop fifo colls carrier compressed\n"
+            f"eth0: {rx_bytes} 0 0 0 0 0 0 0 "
+            f"{tx_bytes} 0 0 0 0 0 0 0\n"
+        )
+
+    def test_first_sample_exposes_cumulative_counters(self):
+        with patch(
+            "builtins.open",
+            return_value=io.StringIO(self.proc_net_dev(1000, 2000)),
+        ), patch("health_monitor.time.monotonic", return_value=10.0):
+            result = health_monitor.get_network_io_rates()
+
+        self.assertFalse(result["sample_ready"])
+        self.assertEqual(result["total_rx_bytes"], 1000)
+        self.assertEqual(result["total_tx_bytes"], 2000)
+        self.assertEqual(result["interfaces"]["eth0"]["total_rx_bytes"], 1000)
+
+    def test_second_sample_calculates_rates_and_keeps_totals(self):
+        with patch(
+            "builtins.open",
+            return_value=io.StringIO(self.proc_net_dev(1_000_000, 2_000_000)),
+        ), patch("health_monitor.time.monotonic", return_value=10.0):
+            health_monitor.get_network_io_rates()
+
+        with patch(
+            "builtins.open",
+            return_value=io.StringIO(self.proc_net_dev(3_000_000, 3_000_000)),
+        ), patch("health_monitor.time.monotonic", return_value=12.0):
+            result = health_monitor.get_network_io_rates()
+
+        self.assertTrue(result["sample_ready"])
+        self.assertEqual(result["rx_mbps"], 1.0)
+        self.assertEqual(result["tx_mbps"], 0.5)
+        self.assertEqual(result["total_rx_bytes"], 3_000_000)
+        self.assertEqual(result["total_tx_bytes"], 3_000_000)
+
+

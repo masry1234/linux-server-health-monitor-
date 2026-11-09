@@ -197,7 +197,7 @@ Run code quality checks:
 ruff check .
 ```
 
-The current development test suite contains 38 unit tests.
+The current development test suite contains 46 unit tests.
 
 ## Platform Compatibility
 
@@ -229,3 +229,42 @@ For production environments, validate monitoring results against the target Linu
 No license has been selected yet.
 
 Until a license is added, the project remains under the default copyright terms.
+
+## ServerPulse Dashboard 0.9.0 additions
+
+The live dashboard now provides dedicated in-page views for Dashboard, Metrics, Alerts, Disks, Network, Services, Processes, Logs, History, and Settings. Sidebar navigation updates the URL hash, supports browser back/forward navigation, and does not reload the monitoring process.
+
+The Metrics view adds live CPU I/O wait, RAM and swap details, active connection count, and a per-device disk I/O table. The Network view retains the live RX/TX chart, cumulative interface counters, peak throughput statistics, and per-interface inventory.
+
+## ServerPulse Dashboard 0.7.0 additions
+
+The 0.7 dashboard keeps the existing local dashboard and JSON APIs, and adds:
+
+- Editable CPU, memory, and disk warning/critical thresholds through the Settings section (`GET/POST /api/config`).
+- Configurable excluded mount points. WSL Windows drive mounts (`9p` under `/mnt/<letter>`) remain visible in inventory but are excluded from Linux server capacity health and the disk KPI by default.
+- Extended telemetry cards for CPU I/O wait, swap utilization, and free space on `/`.
+- Search and severity filtering for alert history, plus CSV export for alerts and health history.
+- Live history table refresh, including readable local timestamps.
+- WSL-only filtering for known host-integration noise in journal samples; application and service errors remain visible.
+- Inline SVG interface icons; no external icon image files or network-loaded assets are required.
+
+Run locally:
+
+```bash
+.venv/bin/python -m py_compile health_monitor.py live_dashboard.py
+.venv/bin/python -m unittest -q
+.venv/bin/python live_dashboard.py
+```
+
+Open `http://localhost:8000`. Settings are written to `config.json`; keep a backup before editing configuration manually.
+
+### Platform notes
+
+Network throughput is calculated from Linux interface byte counters and needs at least two collection samples. A displayed zero can be correct when the interface is idle. WSL exposes host-mounted Windows drives as `9p`; those mounts are retained in the inventory but not treated as Linux server disks. systemd and journal availability still depends on the host's systemd configuration and permissions.
+
+
+## ServerPulse 0.8.0 network observability
+
+The dashboard now includes historical network RX/TX throughput, peak download/upload rates for the selected chart range, cumulative received/sent byte counters, and per-interface traffic statistics. The network history is derived from the existing JSONL health report history; cumulative byte counters represent interface counters since the operating system last reset them.
+
+Network throughput requires at least two samples. The first sample establishes a baseline and can correctly show zero throughput.

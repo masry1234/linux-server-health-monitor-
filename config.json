@@ -19,6 +19,13 @@
       "write_critical_mbps": 200
     }
   },
+  "health": {
+    "exclude_mountpoints": [
+      "/mnt/c",
+      "/mnt/d",
+      "/mnt/e"
+    ]
+  },
   "services": {
     "ssh": {
       "enabled": true,

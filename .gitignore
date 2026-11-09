@@ -34,3 +34,24 @@ report.html
 report.json
 health_history.jsonl
 
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Windows metadata
+*:Zone.Identifier
+
+# Local runtime data
+logs/
+health_history.jsonl
+alerts_history.jsonl
+report.json
+report.html
+
+# Local backups and old versions
+*.backup
+*.backup*
+*_v0.6*.py
