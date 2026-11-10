@@ -1,1 +1,1 @@
-# ServerPulse runtime uses Python standard-library modules only.
+requests>=2.32.0,<3.0.0
