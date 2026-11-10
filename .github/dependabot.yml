@@ -1,8 +1,6 @@
-
 version: 2
 
 updates:
-  # Python dependencies
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
@@ -12,7 +10,6 @@ updates:
       - "dependencies"
       - "security"
 
-  # GitHub Actions dependencies
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
