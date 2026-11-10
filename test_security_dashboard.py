@@ -7,7 +7,6 @@ HTML = (ROOT / "health_monitor.py").read_text(encoding="utf-8")
 import security_monitor
 
 
-
 class SecurityDashboardTests(unittest.TestCase):
     def test_security_page_is_in_navigation_and_has_event_table(self):
         self.assertIn('data-page="security"', HTML)

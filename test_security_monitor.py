@@ -1,7 +1,6 @@
-import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import security_monitor as security
@@ -80,7 +79,7 @@ class SecurityStorageAndDetectionTests(unittest.TestCase):
             self.assertEqual(rows[0]["event_type"], "ssh_root_login")
 
     def test_detects_repeated_ssh_failures_from_same_ip(self):
-        stamp = datetime.now(timezone.utc).isoformat()
+        stamp = datetime.now(UTC).isoformat()
         events = [
             {"event_type": "ssh_login_failed", "source_ip": "203.0.113.9", "timestamp_utc": stamp}
             for _ in range(5)
@@ -91,7 +90,7 @@ class SecurityStorageAndDetectionTests(unittest.TestCase):
         self.assertEqual(alerts[0]["severity"], "CRITICAL")
 
     def test_ignores_failures_without_source_ip(self):
-        stamp = datetime.now(timezone.utc).isoformat()
+        stamp = datetime.now(UTC).isoformat()
         events = [
             {"event_type": "ssh_login_failed", "source_ip": None, "timestamp_utc": stamp}
             for _ in range(10)
@@ -101,7 +100,7 @@ class SecurityStorageAndDetectionTests(unittest.TestCase):
     def test_incremental_log_reader_does_not_repeat_old_lines(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "auth.log"
-            state_path = Path(temp) / "state.json"
+
             state = {}
             path.write_text("sshd: Failed password for root from 192.0.2.5 port 22\n", encoding="utf-8")
             first = security.scan_log_paths([str(path)], security.parse_auth_line, state, "auth")

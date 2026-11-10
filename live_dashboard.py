@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import threading
 import time
 from datetime import UTC, datetime
@@ -11,8 +12,8 @@ import health_monitor as monitor
 import notification_service
 import security_monitor
 
-HOST = "127.0.0.1"
-PORT = 8000
+HOST = os.getenv("SERVERPULSE_HOST", "127.0.0.1").strip() or "127.0.0.1"
+PORT = int(os.getenv("SERVERPULSE_PORT", "8000"))
 INTERVAL = 5
 
 logger = monitor.setup_logging()
@@ -765,6 +766,11 @@ function updateTables(report) {
         }
     }
 
+    function setMetric(id, value) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+    }
+
     function updatePerformanceSummary(cpu, memory, read, write, timestamps) {
         function numericValues(values) {
             return values.filter(
@@ -817,11 +823,6 @@ function updateTables(report) {
                 value: maximum.value.toFixed(2) + unit,
                 time: "At " + time
             };
-        }
-
-        function setMetric(id, value) {
-            const element = document.getElementById(id);
-            if (element) element.textContent = value;
         }
 
         const peakCpu = peakDetails(cpu, "%");
@@ -1537,8 +1538,9 @@ if __name__ == "__main__":
 
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
 
-    print(f"Live Dashboard: http://localhost:{PORT}")
-    print(f"API Endpoint: http://localhost:{PORT}/api/health")
+    display_host = "localhost" if HOST in {"0.0.0.0", "::"} else HOST
+    print(f"Live Dashboard: http://{display_host}:{PORT}")
+    print(f"API Endpoint: http://{display_host}:{PORT}/api/health")
     print(f"Update interval: {INTERVAL} seconds")
     print("Dashboard updates without page reload.")
     print("Press CTRL+C to stop.")

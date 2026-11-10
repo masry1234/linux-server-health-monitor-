@@ -11,7 +11,7 @@ import re
 import sqlite3
 import subprocess
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,28 +33,28 @@ DEFAULT_CONFIG = {
     "failed_login_window_minutes": 5,
     "max_events_per_scan": 500,
 }
-SSH_FAILED = re.compile(r"(?P<method>Failed password|authentication failure|Invalid user|Failed publickey)", re.I)
-SSH_SUCCESS = re.compile(r"Accepted (?:password|publickey|keyboard-interactive)", re.I)
-SUDO_COMMAND = re.compile(r"sudo:\s+(?P<user>[^:\s]+)\s*:.*?COMMAND=(?P<command>.+)$", re.I)
-IP_PATTERN = re.compile(r"(?:from\s*|rhost=|SRC=)(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{3,})", re.I)
+SSH_FAILED = re.compile(r"(?P<method>Failed password|authentication failure|Invalid user|Failed publickey)", re.IGNORECASE)
+SSH_SUCCESS = re.compile(r"Accepted (?:password|publickey|keyboard-interactive)", re.IGNORECASE)
+SUDO_COMMAND = re.compile(r"sudo:\s+(?P<user>[^:\s]+)\s*:.*?COMMAND=(?P<command>.+)$", re.IGNORECASE)
+IP_PATTERN = re.compile(r"(?:from\s*|rhost=|SRC=)(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{3,})", re.IGNORECASE)
 USER_ACTION = re.compile(
     r"\b(?P<action>new user|new group|delete user|delete group|modified user|modified group|"
     r"USER_ADD|USER_DEL|USER_MOD|GROUP_ADD|GROUP_DEL|GROUP_MOD)\b.*?"
     r"(?:name=|user=|group=|account\s+)(?P<account>[A-Za-z0-9_.-]+)?",
-    re.I,
+    re.IGNORECASE,
 )
 FIREWALL_CHANGE = re.compile(
     r"(?:COMMAND=.*(?:ufw|iptables|ip6tables|nft)\s+(?:add|delete|insert|flush|set|enable|disable)|"
     r"type=EXECVE.*(?:ufw|iptables|ip6tables|nft)|"
     r"(?:UFW|iptables|nftables).*(?:ruleset|rules).*(?:changed|updated|reload))",
-    re.I,
+    re.IGNORECASE,
 )
-UFW_EVENT = re.compile(r"\[UFW\s+(?P<action>BLOCK|ALLOW|REJECT)\]", re.I)
-FAIL2BAN_ACTION = re.compile(r"\[(?P<jail>[^\]]+)\]\s+(?P<action>Ban|Unban)\s+(?P<ip>[0-9a-fA-F:.]+)", re.I)
+UFW_EVENT = re.compile(r"\[UFW\s+(?P<action>BLOCK|ALLOW|REJECT)\]", re.IGNORECASE)
+FAIL2BAN_ACTION = re.compile(r"\[(?P<jail>[^\]]+)\]\s+(?P<action>Ban|Unban)\s+(?P<ip>[0-9a-fA-F:.]+)", re.IGNORECASE)
 
 
 def _utc_now():
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _read_json(path, default):
@@ -159,13 +159,13 @@ def parse_auth_line(line, source="auth.log"):
         return None
     ip_match = IP_PATTERN.search(text)
     source_ip = ip_match.group("ip") if ip_match else None
-    ssh_user = re.search(r"(?:for|user)\s+(?:invalid user\s+)?([A-Za-z0-9_.-]+)", text, re.I)
+    ssh_user = re.search(r"(?:for|user)\s+(?:invalid user\s+)?([A-Za-z0-9_.-]+)", text, re.IGNORECASE)
     username = ssh_user.group(1) if ssh_user else None
 
     if SSH_FAILED.search(text):
         return _event("ssh_login_failed", "WARNING", source, text, username, source_ip)
     if SSH_SUCCESS.search(text):
-        method = re.search(r"Accepted\s+([a-z-]+)", text, re.I)
+        method = re.search(r"Accepted\s+([a-z-]+)", text, re.IGNORECASE)
         return _event(
             "ssh_root_login" if username == "root" else "ssh_login_success",
             "WARNING" if username == "root" else "INFO",
@@ -179,14 +179,14 @@ def parse_auth_line(line, source="auth.log"):
         command = sudo_match.group("command").strip()[:1000]
         firewall_command = bool(re.search(
             r"\b(ufw|iptables|ip6tables|nft)\b.*(?:\b(add|delete|insert|flush|set|enable|disable|allow|deny|reject)\b|\s-[ADIRF]\b)",
-            command, re.I,
+            command, re.IGNORECASE,
         ))
         return _event(
             "sudo_command", "INFO", source, text, username=user,
             command=command, security_tag="firewall_change" if firewall_command else None,
         )
 
-    audit_action = re.search(r"type=(USER_ADD|USER_DEL|USER_MGMT|GROUP_ADD|GROUP_DEL|GROUP_MGMT)", text, re.I)
+    audit_action = re.search(r"type=(USER_ADD|USER_DEL|USER_MGMT|GROUP_ADD|GROUP_DEL|GROUP_MGMT)", text, re.IGNORECASE)
     action_match = USER_ACTION.search(text)
     command_action = re.search(r"\b(useradd|userdel|usermod|groupadd|groupdel|groupmod)\b", text)
     if audit_action or action_match or command_action:
@@ -195,10 +195,10 @@ def parse_auth_line(line, source="auth.log"):
             else action_match.group("action").lower().replace(" ", "_") if action_match
             else command_action.group(1).lower()
         )
-        account_match = re.search(r"(?:acct|name|user|group)=['\\\"]?([A-Za-z0-9_.-]+)", text, re.I)
+        account_match = re.search(r"(?:acct|name|user|group)=['\\\"]?([A-Za-z0-9_.-]+)", text, re.IGNORECASE)
         action_account = re.search(
             r"(?:new|delete|modified)\s+(?:user|group)\s+[\'\\\"]?([A-Za-z0-9_.-]+)",
-            text, re.I,
+            text, re.IGNORECASE,
         )
         if account_match:
             account = account_match.group(1)
@@ -361,14 +361,14 @@ def check_sensitive_files(paths, baseline_path=None, state_path=None, state_data
 
 def detect_anomalies(events, failed_threshold=5, window_minutes=5):
     """Flag repeated SSH failures by source IP in the supplied recent event batch."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff = now - timedelta(minutes=max(1, int(window_minutes)))
     counts = {}
     for event in events:
         if event.get("event_type") != "ssh_login_failed" or not event.get("source_ip"):
             continue
         try:
-            stamp = datetime.fromisoformat(event["timestamp_utc"].replace("Z", "+00:00"))
+            stamp = datetime.fromisoformat(event["timestamp_utc"])
         except (KeyError, ValueError, TypeError):
             continue
         if stamp >= cutoff:
@@ -420,8 +420,8 @@ def collect_security_events(config=None, logger=None, state_path=None, db_path=N
     try:
         last_check = datetime.fromisoformat(state.get("last_integrity_check", "1970-01-01T00:00:00+00:00"))
     except (TypeError, ValueError):
-        last_check = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    if baseline_file.exists() and datetime.now(timezone.utc) - last_check >= timedelta(seconds=integrity_interval):
+        last_check = datetime(1970, 1, 1, tzinfo=UTC)
+    if baseline_file.exists() and datetime.now(UTC) - last_check >= timedelta(seconds=integrity_interval):
         events.extend(check_sensitive_files(
             options.get("sensitive_files", []), baseline_path=baseline_file,
             state_path=state_file, state_data=state,
@@ -449,7 +449,7 @@ def collect_security_events(config=None, logger=None, state_path=None, db_path=N
                 previous_time = datetime.fromisoformat(previous) if previous else None
             except (TypeError, ValueError):
                 previous_time = None
-            if previous_time and datetime.now(timezone.utc) - previous_time < timedelta(seconds=window_seconds):
+            if previous_time and datetime.now(UTC) - previous_time < timedelta(seconds=window_seconds):
                 continue
             accepted_anomalies.append(anomaly)
             alert_state[ip] = anomaly["timestamp_utc"]

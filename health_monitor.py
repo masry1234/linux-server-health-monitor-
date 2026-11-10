@@ -1264,7 +1264,7 @@ def _numeric_metric(report, path, default=0.0):
 def get_history_analytics(range_minutes=60, max_points=300):
     """Return bounded historical time-series, aggregate statistics and outliers."""
     if isinstance(range_minutes, bool) or not isinstance(range_minutes, int):
-        raise ValueError("range_minutes must be an integer")
+        raise TypeError("range_minutes must be an integer")
     if range_minutes not in {5, 15, 60, 360, 1440, 10080}:
         raise ValueError("Unsupported analytics range")
     if isinstance(max_points, bool) or not isinstance(max_points, int) or not 10 <= max_points <= 1000:

@@ -25,17 +25,15 @@ def _enabled(name: str, default: bool = False) -> bool:
 
 def _alert_text(event: dict) -> str:
     severity = str(event.get("severity", "ALERT")).upper()
-    return "\n".join((
+    return "\\n".join((
         f"ServerPulse {severity}",
         f"Resource: {event.get('name', 'unknown')}",
         f"Value: {event.get('value', 'N/A')}",
         f"Threshold: {event.get('threshold', 'N/A')}",
-        f"Status: {event.get('previous_status', 'UNKNOWN')} -> "
-        f"{event.get('current_status', 'UNKNOWN')}",
+        f"Status: {event.get('previous_status', 'UNKNOWN')} -> {event.get('current_status', 'UNKNOWN')}",
         f"Message: {event.get('message', 'No details')}",
         f"Time (UTC): {event.get('timestamp_utc', 'unknown')}",
     ))
-
 
 def send_telegram(event: dict) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()

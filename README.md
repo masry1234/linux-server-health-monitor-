@@ -82,88 +82,95 @@ Built for Linux system administration, server troubleshooting, infrastructure mo
 
 ```text
 linux-server-health-monitor/
-│
-├── .github/
-│   └── workflows/
-│
-├── logs/
-│
-├── health_monitor.py
-├── test_health_monitor.py
+├── .github/workflows/
 ├── config.json
-├── health_history.jsonl
-├── report.json
-├── report.html
-├── README.md
-└── .gitignore
+├── config.example.json
+├── security_config.example.json
+├── .env.example
+├── requirements.txt
+├── requirements-dev.txt
+├── install.sh
+├── start.sh
+├── stop.sh
+├── uninstall.sh
+├── health_monitor.py
+├── live_dashboard.py
+├── security_monitor.py
+├── notification_service.py
+├── test_*.py
+├── CHANGELOG.md
+└── README.md
 ```
 
 ## Requirements
 
-- Python 3.10 or newer (uses the standard-library `sqlite3` module).
-- No third-party runtime packages are required for the monitoring engine or dashboard.
-- Linux or Ubuntu under WSL2
-- Git
-- systemd and standard Linux utilities for supported diagnostics
-- jq (optional, for JSON inspection)
+- Python 3.10 or newer, including the `venv` module.
+- Ubuntu 20.04/22.04/24.04 or another modern Linux distribution; WSL2 is suitable for development.
+- Git (for cloning and updates).
+- systemd and standard Linux utilities for supported diagnostics; `jq` is optional.
+- No third-party Python runtime packages are currently required.
 
 Some monitoring features depend on kernel interfaces, system permissions, and available system utilities.
 
 ## Installation
 
-Clone the repository:
+Clone the repository and run the installer:
 
 ```bash
 git clone https://github.com/masry1234/linux-server-health-monitor-.git
-
 cd linux-server-health-monitor-
+chmod +x install.sh start.sh stop.sh uninstall.sh
+./install.sh
 ```
 
-Create a virtual environment:
+The installer checks the Python version, creates `.venv`, installs the runtime requirements, creates the log directory, preserves existing configuration, and performs a Python compilation check. If Ubuntu cannot create a virtual environment, install the missing package and rerun:
 
 ```bash
-python3 -m venv .venv
-
-source .venv/bin/activate
+sudo apt update
+sudo apt install -y python3-venv
+./install.sh
 ```
 
-## Usage
-
-Run the monitoring tool:
+Start the dashboard:
 
 ```bash
-python health_monitor.py
+./start.sh
 ```
 
-Display JSON output:
+Open `http://127.0.0.1:8000`. Stop a foreground dashboard with `CTRL+C`.
+
+### Optional systemd user service
+
+To install and start ServerPulse as a user-level systemd service:
 
 ```bash
-python health_monitor.py --json
+./install.sh --service
+systemctl --user status serverpulse.service
 ```
 
-Save a JSON report:
+To stop it:
 
 ```bash
-python health_monitor.py --output report.json
+./stop.sh
 ```
 
-Generate an HTML dashboard:
+The service runs as the installing user, not as root. Some security log and system diagnostics may therefore require additional read permissions. The installer does not change firewall rules, SSH settings, users, or system-wide permissions.
+
+### Uninstall
+
+Remove the virtual environment and optional user service while preserving configuration and collected data:
 
 ```bash
-python health_monitor.py --html report.html
+./uninstall.sh
 ```
 
-Generate both reports:
+To explicitly remove runtime databases, state files, and logs as well:
 
 ```bash
-python health_monitor.py --output report.json --html report.html
+./uninstall.sh --purge-data
 ```
 
-Display available options:
-
-```bash
-python health_monitor.py --help
-```
+This destructive option does not remove `config.json` or `.env`.
 
 ## Configuration
 
@@ -201,7 +208,7 @@ Run code quality checks:
 ruff check .
 ```
 
-The current development test suite contains 57 unit tests.
+The current development test suite contains 97 unit tests.
 
 ## Platform Compatibility
 
@@ -227,6 +234,10 @@ For production environments, validate monitoring results against the target Linu
 - [ ] Add advanced historical trend visualization.
 - [ ] Add deployment and scheduling documentation.
 - [ ] Expand monitoring coverage and diagnostic capabilities.
+
+## Deployment and network exposure
+
+The dashboard binds to `127.0.0.1` by default. This avoids exposing its unauthenticated HTTP interface to other machines. `SERVERPULSE_HOST` and `SERVERPULSE_PORT` can be set in `.env` for local runs. Do not bind to `0.0.0.0` or expose port 8000 to an untrusted network until authentication, TLS, and access controls are implemented. The optional systemd user service intentionally overrides the bind address to `127.0.0.1`.
 
 ## License
 

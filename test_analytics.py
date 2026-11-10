@@ -103,8 +103,9 @@ if __name__ == "__main__":
 class AnalyticsApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from http.server import ThreadingHTTPServer
         import threading
+        from http.server import ThreadingHTTPServer
+
         import live_dashboard
 
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), live_dashboard.DashboardHandler)
@@ -121,6 +122,7 @@ class AnalyticsApiTests(unittest.TestCase):
     def test_analytics_endpoint_returns_json(self):
         from http.client import HTTPConnection
         from unittest.mock import patch
+
         import live_dashboard
 
         expected = {"range_minutes": 60, "sample_count": 4, "series": []}

@@ -1,13 +1,11 @@
 """Tests for environment-based notification delivery."""
 
-import json
 import os
 import unittest
 from email.message import EmailMessage
 from unittest.mock import MagicMock, patch
 
 import notification_service
-
 
 SAMPLE_ALERT = {
     "timestamp_utc": "2026-11-10T00:00:00+00:00",

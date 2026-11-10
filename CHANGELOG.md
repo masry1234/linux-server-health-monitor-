@@ -10,3 +10,14 @@
 - Added unit tests for parsing, incremental reads, persistence, integrity checks, anomaly detection, and dashboard integration.
 
 
+
+
+## Unreleased — Installation and portability
+
+- Added a one-command Linux installer with Python/venv checks and runtime setup.
+- Added start/stop helpers and optional systemd user-service installation.
+- Added safe uninstall behavior; runtime data is only purged with an explicit flag.
+- Changed the dashboard default bind address to loopback (`127.0.0.1`) and made host/port configurable through environment variables.
+- Removed a duplicate nested JavaScript `setMetric` helper that caused the dashboard feature test to fail.
+- Added portable default configuration without WSL-specific mount exclusions.
+- Excluded local runtime logs and security state from the source package.
