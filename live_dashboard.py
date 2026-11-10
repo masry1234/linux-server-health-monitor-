@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import threading
 import time
 from datetime import UTC, datetime
@@ -7,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import health_monitor as monitor
+import notification_service
+import security_monitor
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -52,6 +55,30 @@ def validate_dashboard_config(payload):
         if not isinstance(mounts, list) or any(not isinstance(item, str) or not item.startswith("/") for item in mounts):
             raise ValueError("Excluded mount points must be an array of absolute paths")
         current.setdefault("health", {})["exclude_mountpoints"] = sorted(set(mounts))
+    if "disk_io" in payload:
+        values = payload["disk_io"]
+        if not isinstance(values, dict):
+            raise ValueError("Disk I/O thresholds must be an object")
+        disk_io = thresholds.setdefault("disk_io", {})
+        for operation in ("read", "write"):
+            warning_key = f"{operation}_warning_mbps"
+            critical_key = f"{operation}_critical_mbps"
+            warning = values.get(warning_key, disk_io.get(warning_key))
+            critical = values.get(critical_key, disk_io.get(critical_key))
+            if (isinstance(warning, bool) or isinstance(critical, bool)
+                    or not isinstance(warning, (int, float))
+                    or not isinstance(critical, (int, float))
+                    or not math.isfinite(warning) or not math.isfinite(critical)
+                    or warning < 0 or warning >= critical):
+                raise ValueError(f"Invalid {operation} disk I/O thresholds")
+            disk_io[warning_key] = float(warning)
+            disk_io[critical_key] = float(critical)
+    if "refresh_interval_seconds" in payload:
+        interval = payload["refresh_interval_seconds"]
+        if isinstance(interval, bool) or not isinstance(interval, int) or not 1 <= interval <= 300:
+            raise ValueError("Refresh interval must be an integer from 1 to 300 seconds")
+        current["dashboard"] = current.get("dashboard", {})
+        current["dashboard"]["refresh_interval_seconds"] = interval
     if "services" in payload:
         services = payload["services"]
         if not isinstance(services, dict):
@@ -197,6 +224,10 @@ def process_alerts(report):
             alert_history.append(event)
             del alert_history[:-MAX_ALERTS]
             save_alert_event(event)
+            try:
+                notification_service.dispatch_alert_async(event)
+            except Exception:
+                logger.exception("Alert notification dispatch failed")
 
 
 def collect_loop():
@@ -208,13 +239,41 @@ def collect_loop():
             monitor.save_report_history(report, logger)
             process_alerts(report)
 
+            security_config = read_dashboard_config().get("security", {})
+            security_events = security_monitor.collect_security_events(
+                security_config, logger=logger
+            )
+            for security_event in security_events:
+                if security_event.get("severity") == "CRITICAL":
+                    notification_event = {
+                        "severity": "CRITICAL",
+                        "name": f"Security: {security_event.get('event_type', 'event')}",
+                        "message": security_event.get("details", {}).get("message", "Security event detected"),
+                        "timestamp_utc": security_event.get("timestamp_utc"),
+                        "value": security_event.get("source_ip") or security_event.get("username") or "N/A",
+                        "threshold": "Security detection rule",
+                        "previous_status": "MONITORING",
+                        "current_status": "CRITICAL",
+                    }
+                    try:
+                        notification_service.dispatch_alert_async(notification_event)
+                    except Exception:
+                        logger.exception("Security notification dispatch failed")
+
             with report_lock:
                 latest_report = report
 
         except Exception:
             logger.exception("Live monitoring collection failed")
 
-        time.sleep(INTERVAL)
+        try:
+            configured = read_dashboard_config().get("dashboard", {}).get(
+                "refresh_interval_seconds", INTERVAL
+            )
+            sleep_seconds = configured if isinstance(configured, int) and 1 <= configured <= 300 else INTERVAL
+        except (OSError, TypeError, ValueError):
+            sleep_seconds = INTERVAL
+        time.sleep(sleep_seconds)
 
 
 LIVE_SCRIPT = r"""
@@ -239,7 +298,8 @@ LIVE_SCRIPT = r"""
 
 <script>
 (() => {
-    const INTERVAL = 5000;
+    let refreshIntervalMs = 5000;
+    let refreshTimer = null;
     const statusBox = document.getElementById("live-monitor-status");
 
     // Sidebar navigation switches between focused monitoring pages without reloads.
@@ -252,6 +312,7 @@ LIVE_SCRIPT = r"""
         services: ["Services & Sockets", "SYSTEMD / LISTENING SERVICES"],
         processes: ["Process Monitor", "SYSTEM / TOP PROCESSES"],
         logs: ["System Logs", "DIAGNOSTICS / LOG EVENTS"],
+        security: ["Security Monitoring", "SECURITY / HOST EVENTS / INTEGRITY"],
         history: ["Health History", "TELEMETRY / HISTORICAL REPORTS"],
         settings: ["Dashboard Settings", "CONFIGURATION / THRESHOLDS"]
     };
@@ -447,11 +508,12 @@ function updateTables(report) {
                 <td>${escapeHtml(d.mountpoint)}</td>
                 <td>${escapeHtml(d.usage_percent)}%</td>
                 <td>${escapeHtml(d.type)}</td>
+                <td>${escapeHtml(d.inodes?.usage_percent ?? "N/A")}${d.inodes?.usage_percent == null ? "" : "%"}</td>
                 <td>${d.monitored === false ? '<span class="badge neutral">Excluded (WSL)</span>' : '<span class="badge good">Monitored</span>'}</td>
             </tr>
         `),
         "No disk information available.",
-        4
+        5
     );
 
     // Network interfaces
@@ -469,10 +531,13 @@ function updateTables(report) {
                 <td>${report.network_io?.interfaces?.[n.name] ? `${escapeHtml(report.network_io.interfaces[n.name].tx_mbps)} MB/s` : 'Sampling…'}</td>
                 <td>${formatBytes(report.network_io?.interfaces?.[n.name]?.total_rx_bytes)}</td>
                 <td>${formatBytes(report.network_io?.interfaces?.[n.name]?.total_tx_bytes)}</td>
+                <td>${escapeHtml(report.network_io?.interfaces?.[n.name]?.rx_errors ?? "N/A")}</td>
+                <td>${escapeHtml(report.network_io?.interfaces?.[n.name]?.tx_errors ?? "N/A")}</td>
+                <td>${escapeHtml((Number(report.network_io?.interfaces?.[n.name]?.rx_dropped || 0) + Number(report.network_io?.interfaces?.[n.name]?.tx_dropped || 0)))}</td>
             </tr>
         `),
         "No network interfaces available.",
-        8
+        11
     );
 
     // Listening sockets
@@ -490,6 +555,23 @@ function updateTables(report) {
         `),
         "No listening sockets available.",
         4
+    );
+
+    // Established TCP connections
+    const connections = report.network_connections?.items || [];
+    updateTable(
+        "connection-table-body",
+        connections.map(connection => `
+            <tr>
+                <td>${escapeHtml(connection.state)}</td>
+                <td>${escapeHtml(connection.local_address)}</td>
+                <td>${escapeHtml(connection.peer_address)}</td>
+                <td>${escapeHtml(connection.recv_q)}</td>
+                <td>${escapeHtml(connection.send_q)}</td>
+            </tr>
+        `),
+        "No established TCP connections.",
+        5
     );
 
     // Services
@@ -515,10 +597,14 @@ function updateTables(report) {
 
     // Top processes
     const processes = report.top_processes || [];
+    const processQuery = (document.getElementById("process-search")?.value || "").toLowerCase();
+    const visibleProcesses = processes.filter(process =>
+        `${process.pid} ${process.user} ${process.name} ${process.command}`.toLowerCase().includes(processQuery)
+    );
 
     updateTable(
         "process-table-body",
-        processes.map(p => `
+        visibleProcesses.map(p => `
             <tr>
                 <td>${escapeHtml(p.pid)}</td>
                 <td>${escapeHtml(p.user || "N/A")}</td>
@@ -527,7 +613,7 @@ function updateTables(report) {
                 <td>${escapeHtml(p.memory_percent)}%</td>
             </tr>
         `),
-        "No process information available.",
+        "No matching processes.",
         5
     );
 
@@ -763,41 +849,31 @@ function updateTables(report) {
         const minutes = Number(rangeSelect?.value || 60);
         const cutoff = Date.now() - minutes * 60 * 1000;
 
-        const valid = (history || [])
-            .filter(item =>
-                item &&
-                typeof item === "object" &&
-                item.timestamp_utc &&
-                !Number.isNaN(Date.parse(item.timestamp_utc))
-            )
+        const source = Array.isArray(history?.series) ? history.series : (history || []);
+        const valid = source
+            .filter(item => item && typeof item === "object" && item.timestamp_utc)
+            .filter(item => !Number.isNaN(Date.parse(item.timestamp_utc)))
             .filter(item => Date.parse(item.timestamp_utc) >= cutoff)
-            .sort((a, b) =>
-                Date.parse(a.timestamp_utc) - Date.parse(b.timestamp_utc)
-            );
+            .sort((a, b) => Date.parse(a.timestamp_utc) - Date.parse(b.timestamp_utc));
 
         const timestamps = valid.map(item => item.timestamp_utc);
-        const cpu = valid.map(item => item.cpu?.usage_percent ?? 0);
-        const memory = valid.map(item => item.memory?.usage_percent ?? 0);
-
-        const read = valid.map(item => {
-            const devices = item.disk_io || {};
-            return Object.values(devices).reduce(
-                (sum, device) =>
-                    sum + (Number(device.read_bytes_per_sec) || 0),
-                0
-            ) / (1024 * 1024);
-        });
-
-        const write = valid.map(item => {
-            const devices = item.disk_io || {};
-            return Object.values(devices).reduce(
-                (sum, device) =>
-                    sum + (Number(device.write_bytes_per_sec) || 0),
-                0
-            ) / (1024 * 1024);
-        });
+        const cpu = valid.map(item => item.cpu_percent ?? item.cpu?.usage_percent ?? 0);
+        const memory = valid.map(item => item.memory_percent ?? item.memory?.usage_percent ?? 0);
+        const read = valid.map(item => item.disk_read_mb_s ?? Object.values(item.disk_io || {}).reduce(
+            (sum, device) => sum + (Number(device.read_bytes_per_sec) || 0), 0
+        ) / (1024 * 1024));
+        const write = valid.map(item => item.disk_write_mb_s ?? Object.values(item.disk_io || {}).reduce(
+            (sum, device) => sum + (Number(device.write_bytes_per_sec) || 0), 0
+        ) / (1024 * 1024));
 
         updatePerformanceSummary(cpu, memory, read, write, timestamps);
+        const anomalies = history?.anomalies || [];
+        setMetric("summary-anomalies", anomalies.length);
+        setMetric("summary-samples", history?.sample_count ?? valid.length);
+        const anomalyDetail = anomalies.slice(0, 2).map(item =>
+            `${item.metric.replace("_percent", "").toUpperCase()} ${item.value}%`
+        ).join(" · ");
+        setMetric("summary-anomaly-detail", anomalyDetail || "No statistical outliers in this period");
 
         drawChart(
             "cpu-chart", cpu, "#38bdf8", 100, "CPU %",
@@ -825,12 +901,8 @@ function updateTables(report) {
             timestamps
         );
 
-        const networkRx = valid.map(item =>
-            Number(item.network_io?.rx_mbps) || 0
-        );
-        const networkTx = valid.map(item =>
-            Number(item.network_io?.tx_mbps) || 0
-        );
+        const networkRx = valid.map(item => Number(item.network_rx_mb_s ?? item.network_io?.rx_mbps) || 0);
+        const networkTx = valid.map(item => Number(item.network_tx_mb_s ?? item.network_io?.tx_mbps) || 0);
         const networkMax = Math.max(1, ...networkRx, ...networkTx) * 1.15;
         drawChart(
             "network-io-chart",
@@ -954,12 +1026,15 @@ function updateTables(report) {
 
     async function refreshHistory() {
         try {
-            const response = await fetch("/api/history", {
-                cache: "no-store"
-            });
-            if (!response.ok) throw new Error("History API failed");
-            const history = await response.json();
-            updateCharts(history);
+            const rangeMinutes = Number(document.getElementById("chart-range")?.value || 60);
+            const [analyticsResponse, historyResponse] = await Promise.all([
+                fetch(`/api/analytics?range_minutes=${rangeMinutes}`, {cache: "no-store"}),
+                fetch("/api/history", {cache: "no-store"})
+            ]);
+            if (!analyticsResponse.ok || !historyResponse.ok) throw new Error("History API failed");
+            const analytics = await analyticsResponse.json();
+            const history = await historyResponse.json();
+            updateCharts(analytics);
             const body = document.getElementById("history-table-body");
             if (body) {
                 const rows = history.slice(-10).reverse().map(item => {
@@ -969,7 +1044,7 @@ function updateTables(report) {
                 });
                 updateTable("history-table-body", rows, "No health history available.", 4);
                 const summary = document.getElementById("history-summary");
-                if (summary) summary.textContent = `${history.length} retained samples`;
+                if (summary) summary.textContent = `${analytics.sample_count} samples in selected range · ${history.length} recent reports loaded`;
             }
         } catch (error) {
             console.error("Chart history update failed:", error);
@@ -985,6 +1060,14 @@ function updateTables(report) {
         const response = await fetch("/api/config", {cache: "no-store"});
         if (!response.ok) throw new Error("Could not load settings");
         const config = await response.json();
+        const configuredInterval = Number(config.dashboard?.refresh_interval_seconds);
+        if (Number.isInteger(configuredInterval) && configuredInterval >= 1 && configuredInterval <= 300) {
+            refreshIntervalMs = configuredInterval * 1000;
+            if (refreshTimer) clearInterval(refreshTimer);
+            refreshTimer = setInterval(refreshDashboard, refreshIntervalMs);
+        }
+        const refreshInput = document.getElementById("setting-refresh-interval");
+        if (refreshInput) refreshInput.value = String(config.dashboard?.refresh_interval_seconds ?? 5);
         for (const resource of ["cpu", "memory", "disk"]) {
             const values = config.thresholds?.[resource] || {};
             const warning = document.getElementById(`setting-${resource}-warning`);
@@ -1011,6 +1094,8 @@ function updateTables(report) {
                 critical: Number(document.getElementById(`setting-${resource}-critical`).value)
             };
         }
+        const refreshInput = document.getElementById("setting-refresh-interval");
+        if (refreshInput) payload.refresh_interval_seconds = Number(refreshInput.value);
         payload.exclude_mountpoints = (document.getElementById("setting-excluded-mounts")?.value || "")
             .split(/\r?\n/).map(value => value.trim()).filter(Boolean);
         payload.services = Object.fromEntries(["ssh", "sshd", "docker", "nginx"].map(name => [
@@ -1024,7 +1109,8 @@ function updateTables(report) {
             });
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || "Save failed");
-            if (status) status.textContent = "Saved. New thresholds apply on the next collection cycle.";
+            if (status) status.textContent = "Saved. Dashboard refresh settings apply immediately; monitoring settings apply on the next collection cycle.";
+            await loadSettings();
         } catch (error) {
             if (status) status.textContent = error.message;
         }
@@ -1071,6 +1157,13 @@ function updateTables(report) {
         setText("metrics-swap-total", `Total swap: ${gb(memory.swap_total_bytes)}`);
         setText("metrics-connections", report.active_connections == null
             ? "N/A" : String(report.active_connections));
+        const coreBody = document.getElementById("cpu-core-table-body");
+        if (coreBody) {
+            const cores = Object.entries(report.cpu?.per_core_usage_percent || {});
+            updateTable("cpu-core-table-body", cores.map(([name, value]) =>
+                `<tr><td>${escapeHtml(name)}</td><td>${escapeHtml(Number(value).toFixed(1))}%</td></tr>`
+            ), "Per-core CPU metrics unavailable.", 2);
+        }
         const body = document.getElementById("disk-io-device-body");
         if (!body) return;
         const devices = Object.entries(report.disk_io || {});
@@ -1171,6 +1264,34 @@ function updateTables(report) {
         setText("extended-root-free", Number.isFinite(freeBytes) ? `${(freeBytes / 1073741824).toFixed(1)} GB` : "N/A");
     }
 
+    async function refreshSecurityEvents() {
+        const body = document.getElementById("security-events-body");
+        if (!body) return;
+        const selectedType = document.getElementById("security-event-filter")?.value || "";
+        const query = new URLSearchParams({limit: "200"});
+        if (selectedType) query.set("event_type", selectedType);
+        try {
+            const [eventsResponse, statusResponse] = await Promise.all([
+                fetch(`/api/security/events?${query.toString()}`, {cache: "no-store"}),
+                fetch("/api/security/status", {cache: "no-store"})
+            ]);
+            if (!eventsResponse.ok || !statusResponse.ok) throw new Error("Security API unavailable");
+            const [events, status] = await Promise.all([eventsResponse.json(), statusResponse.json()]);
+            const count = type => events.filter(item => item.event_type === type).length;
+            document.getElementById("security-ssh-failed").textContent = count("ssh_login_failed");
+            document.getElementById("security-ssh-success").textContent = count("ssh_login_success");
+            document.getElementById("security-sudo").textContent = count("sudo_command");
+            document.getElementById("security-critical").textContent = events.filter(item => item.severity === "CRITICAL").length;
+            document.getElementById("security-fail2ban").textContent = status.fail2ban.available ? `Active · ${status.fail2ban.jails.length} jails` : (status.fail2ban.installed ? "Unavailable" : "Not installed");
+            document.getElementById("security-summary").textContent = `${events.length} recent events · refreshed ${new Date().toLocaleTimeString()}`;
+            body.innerHTML = events.length ? events.map(item => `<tr><td>${escapeHtml(item.timestamp_utc)}</td><td><span class="badge ${item.severity === "CRITICAL" ? "critical" : item.severity === "WARNING" ? "warning" : "good"}">${escapeHtml(item.severity)}</span></td><td>${escapeHtml(item.event_type)}</td><td>${escapeHtml(item.username || "—")}</td><td>${escapeHtml(item.source_ip || "—")}</td><td class="command-cell">${escapeHtml(item.details?.message || "")}</td></tr>`).join("") : '<tr><td colspan="6">No security events collected yet.</td></tr>';
+        } catch (error) {
+            document.getElementById("security-summary").textContent = error.message;
+        }
+    }
+    document.getElementById("security-refresh")?.addEventListener("click", refreshSecurityEvents);
+    document.getElementById("security-event-filter")?.addEventListener("change", refreshSecurityEvents);
+
     async function refreshDashboard() {
         try {
             const response = await fetch("/api/health", {
@@ -1182,12 +1303,14 @@ function updateTables(report) {
             }
 
             const report = await response.json();
+            window.latestServerPulseReport = report;
             updateOverview(report);
             updateMetricsDetails(report);
             updateCards(report);
             updateTables(report);
             await refreshHistory();
             await refreshAlerts();
+            await refreshSecurityEvents();
 
         } catch (error) {
             statusBox.classList.add("offline");
@@ -1195,8 +1318,12 @@ function updateTables(report) {
         }
     }
 
+    document.getElementById("chart-range")?.addEventListener("change", refreshHistory);
+    document.getElementById("process-search")?.addEventListener("input", () => {
+        if (window.latestServerPulseReport) updateTables(window.latestServerPulseReport);
+    });
     refreshDashboard();
-    setInterval(refreshDashboard, INTERVAL);
+    refreshTimer = setInterval(refreshDashboard, refreshIntervalMs);
 })();
 </script>
 """
@@ -1207,6 +1334,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/config":
             content = json.dumps(read_dashboard_config(), ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        if self.path == "/api/security/status":
+            config = dict(security_monitor.DEFAULT_CONFIG)
+            config.update(read_dashboard_config().get("security", {}))
+            status = {
+                "enabled": config.get("enabled", True),
+                "fail2ban": security_monitor.get_fail2ban_status(),
+                "log_sources": {
+                    "auth": [path for path in config.get("auth_log_paths", []) if Path(path).exists()],
+                    "audit": [path for path in config.get("audit_log_paths", []) if Path(path).exists()],
+                    "firewall": [path for path in config.get("firewall_log_paths", []) if Path(path).exists()],
+                    "fail2ban": [path for path in config.get("fail2ban_log_paths", []) if Path(path).exists()],
+                },
+                "file_baseline_initialized": security_monitor.BASELINE_FILE.exists(),
+            }
+            content = json.dumps(status, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        if self.path.startswith("/api/security/events"):
+            from urllib.parse import parse_qs, urlsplit
+            parsed = urlsplit(self.path)
+            if parsed.path != "/api/security/events":
+                self.send_error(404)
+                return
+            query = parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["200"])[0])
+                event_type = query.get("event_type", [None])[0]
+                events = security_monitor.get_events(limit=limit, event_type=event_type)
+            except (TypeError, ValueError):
+                self.send_error(400, "Invalid security event query")
+                return
+            content = json.dumps(events, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -1229,6 +1402,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(
                 json.dumps(alerts, ensure_ascii=False).encode("utf-8")
             )
+            return
+
+        if self.path.startswith("/api/analytics"):
+            from urllib.parse import parse_qs, urlsplit
+            parsed_path = urlsplit(self.path)
+            if parsed_path.path != "/api/analytics":
+                self.send_error(404)
+                return
+            query = parse_qs(parsed_path.query)
+            try:
+                range_minutes = int(query.get("range_minutes", ["60"])[0])
+                analytics = monitor.get_history_analytics(range_minutes=range_minutes)
+            except (TypeError, ValueError):
+                self.send_error(400, "Invalid analytics range")
+                return
+            content = json.dumps(analytics, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
             return
 
         if self.path == "/api/history":
@@ -1303,6 +1498,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         try:
+            origin = self.headers.get("Origin")
+            if origin:
+                from urllib.parse import urlparse
+                parsed_origin = urlparse(origin)
+                if (parsed_origin.hostname not in {"localhost", "127.0.0.1", "::1"}
+                        or parsed_origin.netloc != self.headers.get("Host")):
+                    raise ValueError("Cross-origin settings updates are not allowed")
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > 16384:
                 raise ValueError("Invalid settings payload size")

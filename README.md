@@ -7,10 +7,10 @@ Built for Linux system administration, server troubleshooting, infrastructure mo
 ## Key Features
 
 ### System Resource Monitoring
-- CPU utilization and logical CPU count.
+- CPU utilization, per-logical-core utilization, and logical CPU count.
 - CPU I/O wait monitoring.
 - RAM and Swap utilization.
-- Disk capacity and filesystem utilization.
+- Disk capacity, filesystem utilization, and inode utilization.
 - System load average and uptime.
 
 ### Disk I/O Monitoring
@@ -25,13 +25,15 @@ Built for Linux system administration, server troubleshooting, infrastructure mo
 - Network interface information.
 - IP address detection.
 - Listening TCP and UDP sockets.
+- Established TCP connection endpoints and per-interface packet/error/drop counters.
 
 ### Process Monitoring
-- Top processes by CPU utilization.
+- Top 25 processes by CPU utilization with dashboard-side search.
 - Process-level resource information.
 
 ### System Service Diagnostics
 - Configurable service monitoring.
+- Configurable dashboard refresh interval (1–300 seconds).
 - Systemd service status checks.
 - Failed systemd unit detection.
 - System health degradation assessment.
@@ -46,7 +48,8 @@ Built for Linux system administration, server troubleshooting, infrastructure mo
 - JSON report generation.
 - Standalone HTML health dashboard.
 - System diagnostics summaries.
-- Historical health data stored in JSONL format.
+- Historical health data stored in SQLite with a 10,000-record retention limit.
+- Automatic one-time import of valid legacy JSONL history; the original JSONL file is preserved.
 
 ### Logging and Reliability
 - Rotating log files.
@@ -69,7 +72,7 @@ Built for Linux system administration, server troubleshooting, infrastructure mo
 | systemctl | Service diagnostics |
 | ip / ss | Network diagnostics |
 | df / free | Resource monitoring |
-| JSON / JSONL | Data storage and reporting |
+| JSON / JSONL / SQLite | Configuration, legacy import, history storage, and reporting |
 | HTML / CSS | Health dashboard |
 | unittest | Automated testing |
 | Ruff | Code quality |
@@ -97,7 +100,8 @@ linux-server-health-monitor/
 
 ## Requirements
 
-- Python 3
+- Python 3.10 or newer (uses the standard-library `sqlite3` module).
+- No third-party runtime packages are required for the monitoring engine or dashboard.
 - Linux or Ubuntu under WSL2
 - Git
 - systemd and standard Linux utilities for supported diagnostics
@@ -197,7 +201,7 @@ Run code quality checks:
 ruff check .
 ```
 
-The current development test suite contains 46 unit tests.
+The current development test suite contains 57 unit tests.
 
 ## Platform Compatibility
 
@@ -268,3 +272,84 @@ Network throughput is calculated from Linux interface byte counters and needs at
 The dashboard now includes historical network RX/TX throughput, peak download/upload rates for the selected chart range, cumulative received/sent byte counters, and per-interface traffic statistics. The network history is derived from the existing JSONL health report history; cumulative byte counters represent interface counters since the operating system last reset them.
 
 Network throughput requires at least two samples. The first sample establishes a baseline and can correctly show zero throughput.
+
+
+## Current development status
+
+The `1.0.0-dev` core branch adds per-core CPU, filesystem inode metrics, expanded network telemetry, established TCP connection details, process search, configurable refresh, and SQLite history with legacy JSONL migration. This is a development build: validate it on the target Ubuntu Server version before production deployment.
+
+## Telegram and Email Notifications
+
+ServerPulse can send every alert state transition (WARNING, CRITICAL, and RECOVERED) to Telegram and/or email. Delivery runs in a background thread so SMTP or network timeouts do not block metric collection. Existing alert-state deduplication prevents repeated notifications while a resource remains in the same state.
+
+Credentials are read only from process environment variables. They are not stored in `config.json` or exposed through the dashboard API. Start from the example file:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Edit `.env` with the values for the channels you want to enable. Load it into the current shell before starting the dashboard:
+
+```bash
+set -a
+. ./.env
+set +a
+python live_dashboard.py
+```
+
+Set `TELEGRAM_ENABLED=true` and provide `TELEGRAM_BOT_TOKEN` plus `TELEGRAM_CHAT_ID` to enable Telegram. Set `EMAIL_ENABLED=true` and provide `SMTP_HOST`, `SMTP_FROM`, and comma-separated `SMTP_TO` recipients to enable email. Authenticated SMTP uses `SMTP_USERNAME` and `SMTP_PASSWORD`; port 587 with STARTTLS is the default. For implicit TLS, use port 465 with `SMTP_USE_SSL=true` and `SMTP_USE_TLS=false`.
+
+For systemd deployments, use a root-owned environment file outside the repository and reference it with `EnvironmentFile=/etc/serverpulse/serverpulse.env` in the service unit. Restrict its permissions (for example, `chmod 600`) and never commit `.env` or real credentials. `.env` is ignored by Git; `.env.example` contains placeholders only.
+
+Delivery failures are logged without exposing tokens or SMTP passwords. Missing credentials skip only the affected channel. A failed delivery does not stop monitoring or alter the alert state.
+
+
+## Historical Analytics
+
+The dashboard's Performance Analytics now queries SQLite history for selectable periods (5 minutes, 15 minutes, 1 hour, 6 hours, 24 hours, and 7 days). The analytics response includes sample count, bounded/downsampled time-series, average/minimum/maximum values for CPU, memory, disk I/O, and network throughput, plus statistical CPU/memory outliers. Outlier detection uses a median/MAD baseline and a minimum 10-percentage-point deviation; it is a heuristic for investigation, not a predictive model or a security verdict.
+
+The API endpoint is `GET /api/analytics?range_minutes=60`. Supported ranges are `5`, `15`, `60`, `360`, `1440`, and `10080`. The endpoint returns at most 300 chart points by default while preserving the total `sample_count` and aggregate calculations over all samples in the selected period. Historical retention remains limited to the latest 10,000 reports.
+
+
+## Advanced Security Monitoring (Ubuntu 20.04 / 22.04 / 24.04)
+
+ServerPulse includes a read-only host security collector for:
+- SSH failed, successful, and root login events.
+- Sudo command auditing, including commands that mutate firewall rules.
+- User and group creation, deletion, and modification events from available auth/audit logs.
+- UFW packet events and firewall changes recorded by sudo/audit logs.
+- Fail2ban ban/unban log events and a read-only `fail2ban-client status` check.
+- SHA-256 integrity checks for selected sensitive system files.
+- SSH brute-force detection based on failed attempts accumulated across collection cycles.
+
+Security events are stored in the existing `health_history.sqlite3` database in a separate `security_events` table. The existing telemetry schema and history are not modified.
+
+### File integrity baseline
+
+Create the initial baseline deliberately, after verifying the host is in a trusted state:
+
+```bash
+sudo .venv/bin/python security_monitor.py --init-baseline
+```
+
+The baseline is stored in `security_file_baseline.json`. Changes are reported; the baseline is not automatically rewritten after a change. Review the event and reinitialize the baseline only after validating the change.
+
+### Permissions
+
+The collector needs read access to the configured authentication/audit/firewall/Fail2ban logs. Access to files such as `/etc/shadow` also requires elevated read permission. For production, run the collector under a dedicated, tightly controlled service identity with only the required read permissions; do not expose the loopback dashboard to untrusted networks.
+
+### API
+
+- `GET /api/security/events?limit=200`
+- `GET /api/security/events?event_type=ssh_login_failed`
+- `GET /api/security/status`
+
+The Security page in the dashboard displays recent events and Fail2ban availability. No account, firewall, SSH, or Fail2ban settings are changed automatically.
+
+### Log-source limitations
+
+- Ubuntu uses `/var/log/auth.log`; `/var/log/secure` is included for later RHEL compatibility.
+- Auditd-specific user/group and firewall command events require auditd rules to be installed and enabled. ServerPulse only reads the audit log; it does not install or change audit rules.
+- Firewall packet events are parsed from UFW log entries. nftables/iptables configuration changes are detected when recorded by sudo or auditd.
+- If the host does not have Fail2ban or a given firewall/log source installed, that source is reported unavailable rather than treated as a failure.

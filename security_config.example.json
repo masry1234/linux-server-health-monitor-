@@ -1,0 +1,32 @@
+{
+  "security": {
+    "enabled": true,
+    "auth_log_paths": [
+      "/var/log/auth.log",
+      "/var/log/secure"
+    ],
+    "audit_log_paths": [
+      "/var/log/audit/audit.log"
+    ],
+    "fail2ban_log_paths": [
+      "/var/log/fail2ban.log"
+    ],
+    "firewall_log_paths": [
+      "/var/log/ufw.log"
+    ],
+    "sensitive_files": [
+      "/etc/passwd",
+      "/etc/shadow",
+      "/etc/group",
+      "/etc/gshadow",
+      "/etc/sudoers",
+      "/etc/ssh/sshd_config",
+      "/etc/ufw/user.rules",
+      "/etc/nftables.conf"
+    ],
+    "failed_login_threshold": 5,
+    "failed_login_window_minutes": 5,
+    "max_events_per_scan": 500,
+    "file_integrity_interval_seconds": 300
+  }
+}
