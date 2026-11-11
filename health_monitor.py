@@ -5,14 +5,16 @@ import math
 import os
 import platform
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "1.0.0-dev"
 MAX_LOG_MESSAGES = 20
 
 LOG_DIR = Path(__file__).with_name("logs")
@@ -245,6 +247,55 @@ def get_cpu_usage():
 
     usage = 100 * (1 - idle_delta / total_delta)
     return round(max(0.0, min(100.0, usage)), 1)
+def get_cpu_usage_per_core(interval=1.0):
+    """Return per-core CPU utilization percentages from /proc/stat."""
+    if interval <= 0:
+        raise ValueError("interval must be greater than zero")
+
+    def read_cores():
+        values = {}
+        try:
+            with open("/proc/stat", encoding="utf-8") as file:
+                for line in file:
+                    fields = line.split()
+                    if not fields or not fields[0].startswith("cpu"):
+                        if values:
+                            break
+                        continue
+                    name = fields[0]
+                    if name == "cpu":
+                        continue
+                    if not name[3:].isdigit() or len(fields) < 5:
+                        continue
+                    counters = [int(value) for value in fields[1:]]
+                    if any(value < 0 for value in counters):
+                        continue
+                    values[name] = (sum(counters), counters[3] + (counters[4] if len(counters) > 4 else 0))
+        except (OSError, ValueError):
+            return None
+        return values or None
+
+    first = read_cores()
+    if first is None:
+        return None
+    time.sleep(interval)
+    second = read_cores()
+    if second is None:
+        return None
+
+    result = {}
+    for name, (total, idle) in second.items():
+        previous = first.get(name)
+        if previous is None:
+            continue
+        total_delta = total - previous[0]
+        idle_delta = idle - previous[1]
+        if total_delta <= 0 or idle_delta < 0:
+            continue
+        result[name] = round(max(0.0, min(100.0, 100 * (1 - idle_delta / total_delta))), 1)
+    return result
+
+
 def get_cpu_iowait():
     first = get_cpu_times()
     if first is None:
@@ -371,6 +422,25 @@ def get_disks():
             })
         except ValueError:
             continue
+
+    inode_output = run_command(["df", "-Pi", "-x", "tmpfs", "-x", "devtmpfs", "-x", "overlay", "-x", "squashfs"])
+    inode_by_mount = {}
+    if inode_output:
+        for line in inode_output.splitlines()[1:]:
+            fields = line.split(None, 5)
+            if len(fields) != 6:
+                continue
+            try:
+                inode_by_mount[fields[5]] = {
+                    "total": int(fields[1]),
+                    "used": int(fields[2]),
+                    "available": int(fields[3]),
+                    "usage_percent": int(fields[4].rstrip("%")),
+                }
+            except ValueError:
+                continue
+    for disk in disks:
+        disk["inodes"] = inode_by_mount.get(disk["mountpoint"])
 
     return disks
 
@@ -521,7 +591,18 @@ def get_network_io_rates():
                 interface = name.strip()
                 if interface == "lo":
                     continue
-                current[interface] = (int(fields[0]), int(fields[8]))
+                if len(fields) < 16:
+                    continue
+                current[interface] = {
+                    "rx_bytes": int(fields[0]),
+                    "rx_packets": int(fields[1]),
+                    "rx_errors": int(fields[2]),
+                    "rx_dropped": int(fields[3]),
+                    "tx_bytes": int(fields[8]),
+                    "tx_packets": int(fields[9]),
+                    "tx_errors": int(fields[10]),
+                    "tx_dropped": int(fields[11]),
+                }
     except (OSError, ValueError):
         return {"rx_mbps": 0.0, "tx_mbps": 0.0, "interfaces": {}, "sample_ready": False}
 
@@ -531,15 +612,23 @@ def get_network_io_rates():
         elapsed = now - previous_time if previous_time is not None else 0
         rx_total = tx_total = 0.0
         per_interface = {}
-        for name, (rx, tx) in current.items():
-            old_rx, old_tx = previous.get(name, (rx, tx))
-            rx_rate = max(0, rx - old_rx) / elapsed / 1_000_000 if elapsed > 0 else 0.0
-            tx_rate = max(0, tx - old_tx) / elapsed / 1_000_000 if elapsed > 0 else 0.0
+        for name, values in current.items():
+            old = previous.get(name, values)
+            rx = values["rx_bytes"]
+            tx = values["tx_bytes"]
+            rx_rate = max(0, rx - old["rx_bytes"]) / elapsed / 1_000_000 if elapsed > 0 else 0.0
+            tx_rate = max(0, tx - old["tx_bytes"]) / elapsed / 1_000_000 if elapsed > 0 else 0.0
             per_interface[name] = {
                 "rx_mbps": round(rx_rate, 3),
                 "tx_mbps": round(tx_rate, 3),
                 "total_rx_bytes": rx,
                 "total_tx_bytes": tx,
+                "rx_packets": values["rx_packets"],
+                "tx_packets": values["tx_packets"],
+                "rx_errors": values["rx_errors"],
+                "tx_errors": values["tx_errors"],
+                "rx_dropped": values["rx_dropped"],
+                "tx_dropped": values["tx_dropped"],
             }
             rx_total += rx_rate
             tx_total += tx_rate
@@ -549,8 +638,8 @@ def get_network_io_rates():
         "rx_mbps": round(rx_total, 3),
         "tx_mbps": round(tx_total, 3),
         "interfaces": per_interface,
-        "total_rx_bytes": sum(item[0] for item in current.values()),
-        "total_tx_bytes": sum(item[1] for item in current.values()),
+        "total_rx_bytes": sum(item["rx_bytes"] for item in current.values()),
+        "total_tx_bytes": sum(item["tx_bytes"] for item in current.values()),
         "sample_ready": elapsed > 0,
     }
 
@@ -591,12 +680,35 @@ def get_network():
     return interfaces
 
 
-def get_active_connection_count():
-    """Count established TCP connections; None means ss is unavailable."""
+def get_network_connections(limit=500):
+    """Return established TCP connections with local/peer endpoints."""
     output = run_command(["ss", "-H", "-tn", "state", "established"])
     if output is None:
-        return None
-    return sum(1 for line in output.splitlines() if line.strip())
+        return {"status": "unavailable", "count": None, "items": []}
+
+    items = []
+    total_count = 0
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        total_count += 1
+        if len(items) >= limit:
+            continue
+        items.append({
+            "state": "ESTABLISHED",
+            "recv_q": fields[0],
+            "send_q": fields[1],
+            "local_address": fields[2],
+            "peer_address": fields[3],
+        })
+    return {"status": "ok", "count": total_count, "items": items, "truncated": total_count > len(items)}
+
+
+def get_active_connection_count():
+    """Count established TCP connections; None means ss is unavailable."""
+    connections = get_network_connections()
+    return connections["count"]
 
 
 def get_listening_sockets():
@@ -698,7 +810,7 @@ def get_top_processes():
 
     processes = []
 
-    for line in output.splitlines()[1:6]:
+    for line in output.splitlines()[1:26]:
         fields = line.split(None, 4)
         if len(fields) != 5:
             continue
@@ -995,42 +1107,79 @@ def assess_health(report, thresholds=None, exclude_mountpoints=None):
     }
 
 HISTORY_FILE = Path(__file__).with_name("health_history.jsonl")
+HISTORY_DB_FILE = Path(__file__).with_name("health_history.sqlite3")
+HISTORY_RETENTION_RECORDS = 10000
 
 
-def save_report_history(report, logger=None):
-    """Append one health report to the local JSONL history."""
-    logger = logger or logging.getLogger("health_monitor")
+def _connect_history_db():
+    connection = sqlite3.connect(HISTORY_DB_FILE, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_utc TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+    """)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reports_timestamp ON reports(timestamp_utc)"
+    )
+    return connection
 
-    try:
-        with HISTORY_FILE.open("a", encoding="utf-8") as file:
-            file.write(
-                json.dumps(report, ensure_ascii=False, separators=(",", ":"))
-                + "\n"
-            )
-    except OSError:
-        logger.exception("Failed to save health report history")
 
-def show_history(limit=10):
-    """Display the most recent health checks from local JSONL history."""
-    if not HISTORY_FILE.exists():
-        print("No health history found yet.")
+def _migrate_jsonl_history(connection, logger=None):
+    """Import legacy JSONL history once, preserving valid records."""
+    count = connection.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+    if count or not HISTORY_FILE.exists():
         return
-
-    reports = []
+    logger = logger or logging.getLogger("health_monitor")
+    imported = []
     try:
         with HISTORY_FILE.open("r", encoding="utf-8") as file:
             for line in file:
-                if not line.strip():
-                    continue
                 try:
                     report = json.loads(line)
                     if isinstance(report, dict):
-                        reports.append(report)
+                        stamp = str(report.get("timestamp_utc") or datetime.now(UTC).isoformat())
+                        imported.append((stamp, json.dumps(report, ensure_ascii=False, separators=(",", ":"))))
                 except json.JSONDecodeError:
                     continue
-    except OSError as error:
-        print(f"Unable to read health history: {error}", file=sys.stderr)
+    except OSError:
+        logger.exception("Unable to migrate legacy JSONL history")
         return
+    if imported:
+        connection.executemany(
+            "INSERT INTO reports(timestamp_utc, payload) VALUES (?, ?)", imported
+        )
+        connection.execute(
+            "DELETE FROM reports WHERE id NOT IN (SELECT id FROM reports ORDER BY id DESC LIMIT ?)",
+            (HISTORY_RETENTION_RECORDS,),
+        )
+
+
+def save_report_history(report, logger=None):
+    """Persist reports in SQLite, migrating legacy JSONL on first write."""
+    logger = logger or logging.getLogger("health_monitor")
+    try:
+        with closing(_connect_history_db()) as connection, connection:
+            _migrate_jsonl_history(connection, logger)
+            stamp = str(report.get("timestamp_utc") or datetime.now(UTC).isoformat())
+            payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+            connection.execute(
+                "INSERT INTO reports(timestamp_utc, payload) VALUES (?, ?)",
+                (stamp, payload),
+            )
+            connection.execute(
+                "DELETE FROM reports WHERE id NOT IN (SELECT id FROM reports ORDER BY id DESC LIMIT ?)",
+                (HISTORY_RETENTION_RECORDS,),
+            )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        logger.exception("Failed to save health report history")
+
+
+def show_history(limit=10):
+    """Display the most recent health checks from the active history store."""
+    reports = load_report_history(max(1, limit))
 
     if not reports:
         print("No valid health history records found.")
@@ -1059,10 +1208,28 @@ def show_history(limit=10):
         )
 
 def load_report_history(limit=10):
-    """Load the most recent valid reports from local JSONL history."""
-    if limit < 1 or not HISTORY_FILE.exists():
+    """Load recent history from SQLite, falling back to legacy JSONL."""
+    if limit < 1:
         return []
-
+    if HISTORY_DB_FILE.exists():
+        try:
+            with closing(_connect_history_db()) as connection, connection:
+                rows = connection.execute(
+                    "SELECT payload FROM reports ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            reports = []
+            for (payload,) in reversed(rows):
+                try:
+                    report = json.loads(payload)
+                    if isinstance(report, dict):
+                        reports.append(report)
+                except json.JSONDecodeError:
+                    continue
+            return reports
+        except sqlite3.Error:
+            logging.getLogger("health_monitor").exception("Failed to read SQLite history")
+    if not HISTORY_FILE.exists():
+        return []
     reports = []
     try:
         with HISTORY_FILE.open("r", encoding="utf-8") as file:
@@ -1070,14 +1237,141 @@ def load_report_history(limit=10):
                 if not line.strip():
                     continue
                 try:
-                    reports.append(json.loads(line))
+                    report = json.loads(line)
+                    if isinstance(report, dict):
+                        reports.append(report)
                 except json.JSONDecodeError:
                     continue
     except OSError:
         return []
-
     return reports[-limit:]
 
+
+
+def _numeric_metric(report, path, default=0.0):
+    value = report
+    for key in path:
+        if not isinstance(value, dict):
+            return default
+        value = value.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if not math.isfinite(value):
+        return default
+    return float(value)
+
+
+def get_history_analytics(range_minutes=60, max_points=300):
+    """Return bounded historical time-series, aggregate statistics and outliers."""
+    if isinstance(range_minutes, bool) or not isinstance(range_minutes, int):
+        raise TypeError("range_minutes must be an integer")
+    if range_minutes not in {5, 15, 60, 360, 1440, 10080}:
+        raise ValueError("Unsupported analytics range")
+    if isinstance(max_points, bool) or not isinstance(max_points, int) or not 10 <= max_points <= 1000:
+        raise ValueError("max_points must be between 10 and 1000")
+
+    from datetime import timedelta
+    cutoff = (datetime.now(UTC) - timedelta(minutes=range_minutes)).isoformat()
+    reports = []
+    if HISTORY_DB_FILE.exists():
+        try:
+            with closing(_connect_history_db()) as connection:
+                rows = connection.execute(
+                    "SELECT payload FROM reports WHERE timestamp_utc >= ? ORDER BY timestamp_utc ASC",
+                    (cutoff,),
+                ).fetchall()
+            for (payload,) in rows:
+                try:
+                    report = json.loads(payload)
+                    if isinstance(report, dict):
+                        reports.append(report)
+                except json.JSONDecodeError:
+                    continue
+        except sqlite3.Error:
+            logging.getLogger("health_monitor").exception("Failed to query analytics history")
+    else:
+        reports = [
+            report for report in load_report_history(HISTORY_RETENTION_RECORDS)
+            if str(report.get("timestamp_utc", "")) >= cutoff
+        ]
+
+    points = []
+    for report in reports:
+        disk_io = report.get("disk_io") or {}
+        read_bps = sum(
+            _numeric_metric(device, ("read_bytes_per_sec",))
+            for device in disk_io.values() if isinstance(device, dict)
+        )
+        write_bps = sum(
+            _numeric_metric(device, ("write_bytes_per_sec",))
+            for device in disk_io.values() if isinstance(device, dict)
+        )
+        network_io = report.get("network_io") or {}
+        points.append({
+            "timestamp_utc": report.get("timestamp_utc"),
+            "cpu_percent": _numeric_metric(report, ("cpu", "usage_percent")),
+            "memory_percent": _numeric_metric(report, ("memory", "usage_percent")),
+            "disk_read_mb_s": read_bps / (1024 * 1024),
+            "disk_write_mb_s": write_bps / (1024 * 1024),
+            "network_rx_mb_s": _numeric_metric(network_io, ("rx_mbps",)),
+            "network_tx_mb_s": _numeric_metric(network_io, ("tx_mbps",)),
+        })
+
+    metric_keys = (
+        "cpu_percent", "memory_percent", "disk_read_mb_s", "disk_write_mb_s",
+        "network_rx_mb_s", "network_tx_mb_s",
+    )
+    summary = {}
+    for key in metric_keys:
+        values = [point[key] for point in points]
+        summary[key] = {
+            "average": round(sum(values) / len(values), 3) if values else None,
+            "minimum": round(min(values), 3) if values else None,
+            "maximum": round(max(values), 3) if values else None,
+        }
+
+    anomalies = []
+    # Require enough history before statistical detection. A small idle CPU
+    # fluctuation should not be treated as an incident just because MAD is 0.
+    minimum_baseline_samples = 9
+    if len(points) >= minimum_baseline_samples + 1:
+        for key in ("cpu_percent", "memory_percent"):
+            values = [point[key] for point in points]
+            ordered = sorted(values)
+            middle = len(ordered) // 2
+            median = (ordered[middle] if len(ordered) % 2 else
+                      (ordered[middle - 1] + ordered[middle]) / 2)
+            deviations = sorted(abs(value - median) for value in values)
+            mad_middle = len(deviations) // 2
+            mad = (deviations[mad_middle] if len(deviations) % 2 else
+                   (deviations[mad_middle - 1] + deviations[mad_middle]) / 2)
+            # CPU idle baselines commonly have median/MAD near zero. Use a
+            # higher absolute floor for CPU to suppress benign scheduler spikes.
+            absolute_floor = 15.0 if key == "cpu_percent" else 10.0
+            threshold = median + max(3.0 * mad, absolute_floor)
+            for point in points:
+                if point[key] > threshold:
+                    anomalies.append({
+                        "timestamp_utc": point["timestamp_utc"],
+                        "metric": key,
+                        "value": round(point[key], 3),
+                        "baseline_median": round(median, 3),
+                        "detection_threshold": round(threshold, 3),
+                    })
+    anomalies.sort(key=lambda item: item["value"], reverse=True)
+
+    if len(points) > max_points:
+        step = (len(points) - 1) / (max_points - 1)
+        points = [points[round(index * step)] for index in range(max_points)]
+
+    return {
+        "range_minutes": range_minutes,
+        "sample_count": len(reports),
+        "returned_points": len(points),
+        "summary": summary,
+        "anomalies": anomalies[:50],
+        "series": points,
+    }
 
 def collect_report(logger=None):
     logger = logger or logging.getLogger("health_monitor")
@@ -1099,6 +1393,14 @@ def collect_report(logger=None):
         logger.error("Configuration loading failed: %s", error)
         raise
 
+    disks = get_disks()
+    disk_io = get_disk_io_rates()
+    network_connections = get_network_connections()
+    if isinstance(disk_io, dict):
+        for disk in disks:
+            source_name = Path(str(disk.get("filesystem", ""))).name
+            disk["io"] = disk_io.get(source_name)
+
     report = {
         "schema_version": "1.0",
         "monitor_version": VERSION,
@@ -1110,20 +1412,22 @@ def collect_report(logger=None):
             "cpu_count": os.cpu_count(),
             "load_average": get_load_average(),
         },
-     "cpu": {
+        "cpu": {
             "usage_percent": get_cpu_usage(),
             "iowait_percent": get_cpu_iowait(),
-            },
+            "per_core_usage_percent": get_cpu_usage_per_core(),
+        },
         "memory": get_memory(),
-        "disks": get_disks(),
-        "disk_io": get_disk_io_rates(),
+        "disks": disks,
+        "disk_io": disk_io,
         "network": get_network(),
         "network_io": get_network_io_rates(),
         "listening_sockets": get_listening_sockets(),
+        "network_connections": network_connections,
         "services": get_services(service_config),
         "top_processes": get_top_processes(),
         "system_diagnostics": get_system_diagnostics(),
-        "active_connections": get_active_connection_count(),
+        "active_connections": network_connections.get("count"),
     }
 
     report["thresholds"] = thresholds
@@ -1303,6 +1607,16 @@ def generate_html_report(report, history=None):
 
     def esc(value):
         return html.escape(str(value if value is not None else "unknown"))
+    def mask_mac(value):
+        mac = str(value).strip() if value is not None else ""
+        if not mac:
+            return "unknown"
+
+        parts = mac.replace("-", ":").split(":")
+        if len(parts) != 6:
+            return "xx:xx:xx:xx:xx:xx"
+
+        return ":".join(["xx"] * 6)
 
     def status_class(value):
         normalized = str(value).lower()
@@ -1418,7 +1732,7 @@ def generate_html_report(report, history=None):
             "<tr>"
             f"<td>{esc(interface.get('name'))}</td>"
             f"<td>{esc(interface.get('state'))}</td>"
-            f"<td>{esc(interface.get('mac_address'))}</td>"
+            f"<td>{esc(mask_mac(interface.get('mac_address')))}</td>"
             f"<td>{esc(', '.join(interface.get('ipv4', [])) or 'N/A')}</td>"
             f"<td>{esc(net_rates.get('rx_mbps', 0))} MB/s</td>"
             f"<td>{esc(net_rates.get('tx_mbps', 0))} MB/s</td>"
@@ -1448,6 +1762,21 @@ def generate_html_report(report, history=None):
         socket_rows.append(
             '<tr><td colspan="4">No listening sockets available.</td></tr>'
         )
+
+    connection_rows = []
+    connection_data = report.get("network_connections") or {}
+    for item in connection_data.get("items", []):
+        connection_rows.append(
+            "<tr>"
+            f"<td>{esc(item.get('state'))}</td>"
+            f"<td>{esc(item.get('local_address'))}</td>"
+            f"<td>{esc(item.get('peer_address'))}</td>"
+            f"<td>{esc(item.get('recv_q'))}</td>"
+            f"<td>{esc(item.get('send_q'))}</td>"
+            "</tr>"
+        )
+    if not connection_rows:
+        connection_rows.append('<tr><td colspan="5">No established TCP connections.</td></tr>')
 
     # Services
     service_rows = []
@@ -1527,7 +1856,14 @@ def generate_html_report(report, history=None):
         )
 
 
-    raw_json = esc(json.dumps(report, indent=2, ensure_ascii=False))
+    safe_report = json.loads(json.dumps(report))
+    for interface in safe_report.get("network", []):
+        if isinstance(interface, dict):
+            interface["mac_address"] = mask_mac(
+                interface.get("mac_address")
+            )
+
+    raw_json = esc(json.dumps(safe_report, indent=2, ensure_ascii=False))
 
     disk_values = [
         item.get("usage_percent")
@@ -1690,7 +2026,8 @@ body[data-page] .main > #history,
 body[data-page] .main > #logs,
 body[data-page] .main > #resource-health-details,
 body[data-page] .main > #settings,
-body[data-page] .main > #json-report {display:none!important}
+body[data-page] .main > #json-report,
+body[data-page] .main > #security {display:none!important}
 body[data-page="dashboard"] .main > .server-overview{display:flex!important}
 body[data-page="dashboard"] .main > .kpi-grid,
 body[data-page="dashboard"] .main > .quick-stats,
@@ -1708,12 +2045,13 @@ body[data-page="alerts"] #processes, body[data-page="processes"] #alerts{display
 body[data-page="disks"] .main > .lower-grid,
 body[data-page="network"] .main > .lower-grid{display:grid!important;grid-template-columns:minmax(0,1fr)!important}
 body[data-page="disks"] #disks, body[data-page="network"] #network{display:block!important}
-body[data-page="disks"] #network, body[data-page="disks"] #services, body[data-page="disks"] #sockets,
+body[data-page="disks"] #network, body[data-page="disks"] #services, body[data-page="disks"] #sockets, body[data-page="disks"] #connections,
 body[data-page="network"] #disks, body[data-page="network"] #services, body[data-page="network"] #sockets{display:none!important}
 body[data-page="services"] .main > .lower-grid{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important}
 body[data-page="services"] #services, body[data-page="services"] #sockets, body[data-page="services"] #failed-units{display:block!important}
-body[data-page="services"] #disks, body[data-page="services"] #network{display:none!important}
+body[data-page="services"] #disks, body[data-page="services"] #network, body[data-page="services"] #connections{display:none!important}
 body[data-page="logs"] .main > #logs,
+body[data-page="security"] .main > #security,
 body[data-page="history"] .main > #history,
 body[data-page="settings"] .main > #settings,
 body[data-page="settings"] .main > #json-report{display:block!important}
@@ -1739,6 +2077,7 @@ body[data-page] .main > footer{display:block}
     <a href="#services" data-page="services"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2m0-14-2 2M7 17l-2 2"/></svg></span>Services</a>
     <a href="#processes" data-page="processes"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8h8v8H8zM9 1v3m6-3v3M9 20v3m6-3v3"/></svg></span>Processes</a>
     <a href="#logs" data-page="logs"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 5h14M5 12h14M5 19h14"/></svg></span>Logs</a>
+    <a href="#security" data-page="security"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.4 8.2-8 10-4.6-1.8-8-5-8-10V6l8-3Z"/><path d="m9 12 2 2 4-4"/></svg></span>Security</a>
     <a href="#history" data-page="history"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>History</a>
     <a href="#settings" data-page="settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg></span>Settings</a>
   </nav>
@@ -1747,7 +2086,7 @@ body[data-page] .main > footer{display:block}
 <main class="main" id="dashboard">
   <div class="topbar">
     <div><div class="eyebrow">INFRASTRUCTURE / OVERVIEW</div><h1 id="page-title">Server Health Dashboard</h1></div>
-    <div class="top-actions"><span class="live-pill" id="live-monitor-status"><span class="live-dot"></span> LIVE · CONNECTING</span><select class="control" id="chart-range"><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="60" selected>1 hour</option></select></div>
+    <div class="top-actions"><span class="live-pill" id="live-monitor-status"><span class="live-dot"></span> LIVE · CONNECTING</span><select class="control" id="chart-range"><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="60" selected>1 hour</option><option value="360">6 hours</option><option value="1440">24 hours</option><option value="10080">7 days</option></select></div>
   </div>
 
   <section class="panel server-overview">
@@ -1764,7 +2103,7 @@ body[data-page] .main > footer{display:block}
 
 
   <section class="panel" id="performance">
-    <div class="section-head"><h2>Performance Analytics</h2><span class="section-note">Historical telemetry · auto refresh every 5 seconds</span></div>
+    <div class="section-head"><h2>Performance Analytics</h2><span class="section-note">Historical telemetry · configurable auto refresh</span></div>
     <div class="chart-grid">
       <article class="panel chart-card"><h3>CPU Usage</h3><canvas id="cpu-chart" height="170"></canvas></article>
       <article class="panel chart-card"><h3>Memory Usage</h3><canvas id="memory-chart" height="170"></canvas></article>
@@ -1777,6 +2116,8 @@ body[data-page] .main > footer{display:block}
       <div class="panel summary-card"><span>PEAK MEMORY</span><strong id="summary-peak-memory">--</strong><small id="summary-peak-memory-time">No data</small></div>
       <div class="panel summary-card"><span>MAX DISK READ</span><strong id="summary-max-read">--</strong><small id="summary-max-read-time">No data</small></div>
       <div class="panel summary-card"><span>MAX DISK WRITE</span><strong id="summary-max-write">--</strong><small id="summary-max-write-time">No data</small></div>
+      <div class="panel summary-card"><span>ANOMALIES DETECTED</span><strong id="summary-anomalies">0</strong><small id="summary-anomaly-detail">No statistical outliers in this period</small></div>
+      <div class="panel summary-card"><span>HISTORICAL SAMPLES</span><strong id="summary-samples">0</strong><small>Samples in selected period</small></div>
     </div>
   </section>
 
@@ -1788,13 +2129,15 @@ body[data-page] .main > footer{display:block}
       <article class="panel extended-card"><small>SWAP USED</small><strong id="metrics-swap-used">N/A</strong><span id="metrics-swap-total">Total swap: N/A</span></article>
       <article class="panel extended-card"><small>ACTIVE CONNECTIONS</small><strong id="metrics-connections">N/A</strong><span>Current network connections</span></article>
     </div>
+    <div class="section-head" style="margin-top:18px"><h2>CPU Utilization by Logical Core</h2><span class="section-note">Per-core sampled utilization</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Logical Core</th><th>CPU Usage</th></tr></thead><tbody id="cpu-core-table-body"><tr><td colspan="2">Waiting for metrics…</td></tr></tbody></table></div>
     <div class="section-head" style="margin-top:18px"><h2>Disk I/O by Device</h2><span class="section-note">Read/write throughput and operation counters</span></div>
     <div class="table-wrap"><table><thead><tr><th>Device</th><th>Read</th><th>Write</th><th>Read Ops/s</th><th>Write Ops/s</th></tr></thead><tbody id="disk-io-device-body"><tr><td colspan="5">Waiting for metrics…</td></tr></tbody></table></div>
   </section>
 
   <div class="two-col">
     <section class="panel" id="alerts"><div class="section-head"><h2>Recent Alerts</h2><span class="section-note" id="alerts-summary">Loading events...</span></div><div class="filter-row"><input class="control filter-input" id="alert-search" type="search" placeholder="Search resource or message"><select class="control" id="alert-severity"><option value="ALL">All severities</option><option value="CRITICAL">Critical</option><option value="WARNING">Warning</option><option value="RECOVERED">Recovered</option></select><button class="control" id="export-alerts">Export CSV</button></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Severity</th><th>Resource</th><th>Value</th><th>Threshold</th><th>Event</th></tr></thead><tbody id="alerts-table-body"><tr><td colspan="6">No alerts yet.</td></tr></tbody></table></div></section>
-    <section class="panel" id="processes"><div class="section-head"><h2>Top Processes</h2><span class="section-note">Sorted by CPU usage</span></div><div class="table-wrap"><table><thead><tr><th>PID</th><th>User</th><th>Command</th><th>CPU</th><th>Memory</th></tr></thead><tbody id="process-table-body">__PROCESS_ROWS__</tbody></table></div></section>
+    <section class="panel" id="processes"><div class="section-head"><h2>Top Processes</h2><span class="section-note">Sorted by CPU usage</span></div><input class="control filter-input" id="process-search" type="search" placeholder="Filter by PID, user or command" aria-label="Filter processes"><div class="table-wrap"><table><thead><tr><th>PID</th><th>User</th><th>Command</th><th>CPU</th><th>Memory</th></tr></thead><tbody id="process-table-body">__PROCESS_ROWS__</tbody></table></div></section>
   </div>
 
   <section class="quick-stats" aria-label="System status summary">
@@ -1827,17 +2170,31 @@ body[data-page] .main > footer{display:block}
           </div>
         </article>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>Interface</th><th>State</th><th>MAC</th><th>IPv4</th><th>RX Rate</th><th>TX Rate</th><th>Total RX</th><th>Total TX</th></tr></thead><tbody id="network-table-body">__NETWORK_ROWS__</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Interface</th><th>State</th><th>MAC</th><th>IPv4</th><th>RX Rate</th><th>TX Rate</th><th>Total RX</th><th>Total TX</th><th>RX Errors</th><th>TX Errors</th><th>Dropped</th></tr></thead><tbody id="network-table-body">__NETWORK_ROWS__</tbody></table></div>
     </section>
     <section class="panel" id="services"><div class="section-head"><h2>Services Status</h2></div><div class="table-wrap"><table><thead><tr><th>Service</th><th>Status</th></tr></thead><tbody id="service-table-body">__SERVICE_ROWS__</tbody></table></div></section>
     <section class="panel" id="sockets"><div class="section-head"><h2>Listening Sockets</h2><span class="section-note">TCP / UDP</span></div><div class="table-wrap"><table><thead><tr><th>Protocol</th><th>State</th><th>Local Address</th><th>Process</th></tr></thead><tbody id="socket-table-body">__SOCKET_ROWS__</tbody></table></div></section>
+    <section class="panel" id="connections"><div class="section-head"><h2>Established TCP Connections</h2><span class="section-note">Active remote endpoints</span></div><div class="table-wrap"><table><thead><tr><th>State</th><th>Local Address</th><th>Peer Address</th><th>Recv-Q</th><th>Send-Q</th></tr></thead><tbody id="connection-table-body">__CONNECTION_ROWS__</tbody></table></div></section>
   </div>
 
   <section class="panel compact-section" id="failed-units"><div class="section-head"><h2>Failed systemd Units</h2><span class="section-note">System diagnostics</span></div><div class="table-wrap"><table><thead><tr><th>Unit</th><th>State</th><th>Description</th></tr></thead><tbody id="failed-units-table-body">__UNIT_ROWS__</tbody></table></div></section>
-  <section class="panel compact-section" id="history"><div class="section-head"><h2>Recent Health History</h2><span class="section-note">Latest health reports</span></div><div class="table-wrap"><table><thead><tr><th>Timestamp (UTC)</th><th>Status</th><th>CPU</th><th>RAM</th></tr></thead><tbody id="history-table-body">__HISTORY_ROWS__</tbody></table></div><div class="section-head" style="margin-top:12px"><span class="section-note" id="history-summary">Latest reports</span><button class="control" id="export-history">Export CSV</button></div></section>
+  <section class="panel compact-section" id="history"><div class="section-head"><h2>Recent Health History</h2><span class="section-note">Latest health reports</span></div><div class="table-wrap"><table><thead><tr><th>Timestamp (Local)</th><th>Status</th><th>CPU</th><th>RAM</th></tr></thead><tbody id="history-table-body">__HISTORY_ROWS__</tbody></table></div><div class="section-head" style="margin-top:12px"><span class="section-note" id="history-summary">Latest reports</span><button class="control" id="export-history">Export CSV</button></div></section>
   <section class="panel compact-section" id="logs"><div class="section-head"><h2>System Logs</h2></div><div class="lower-grid" style="margin-top:0"><div><h3 style="font-size:11px;color:#ff9aaa">Recent errors</h3><ul class="log-list">__ERRORS__</ul></div><div><h3 style="font-size:11px;color:#ffd078">Recent warnings</h3><ul class="log-list">__WARNINGS__</ul></div></div></section>
   <section class="panel compact-section" id="resource-health-details"><div class="section-head"><h2>Resource health: __HEALTH__</h2></div><details><summary>Resource health checks · thresholds and status</summary><div class="grid" style="margin-top:15px">__HEALTH_CARDS__</div></details></section>
-  <section class="panel compact-section" id="settings"><div class="section-head"><h2>Dashboard Settings</h2><span class="section-note">Editable monitoring thresholds and exclusions</span></div><form id="settings-form" class="settings-form"><div class="settings-grid"><label><small>CPU WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-cpu-warning" required></label><label><small>CPU CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-cpu-critical" required></label><label><small>MEMORY WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-memory-warning" required></label><label><small>MEMORY CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-memory-critical" required></label><label><small>DISK WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-disk-warning" required></label><label><small>DISK CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-disk-critical" required></label></div><label class="exclude-label"><small>EXCLUDED MOUNT POINTS (ONE PER LINE)</small><textarea class="control" id="setting-excluded-mounts" rows="3" placeholder="/mnt/c&#10;/mnt/d"></textarea></label><fieldset class="service-settings"><legend>MONITORED SERVICES</legend><label><input type="checkbox" id="setting-service-ssh"> SSH</label><label><input type="checkbox" id="setting-service-sshd"> SSHD</label><label><input type="checkbox" id="setting-service-docker"> Docker</label><label><input type="checkbox" id="setting-service-nginx"> Nginx</label></fieldset><div class="settings-actions"><button class="control primary-control" type="submit">Save settings</button><span id="settings-status" class="section-note" role="status">Loading settings…</span></div></form></section>
+  <section class="panel compact-section" id="security">
+    <div class="section-head"><h2>Security Events</h2><span class="section-note" id="security-summary">Read-only host security telemetry</span></div>
+    <div class="quick-stats">
+      <article class="panel quick-stat"><div><small>FAIL2BAN</small><strong id="security-fail2ban">Checking…</strong></div></article>
+      <article class="panel quick-stat"><div><small>SSH FAILED LOGINS</small><strong id="security-ssh-failed">0</strong></div></article>
+      <article class="panel quick-stat"><div><small>SSH SUCCESSFUL LOGINS</small><strong id="security-ssh-success">0</strong></div></article>
+      <article class="panel quick-stat"><div><small>SUDO COMMANDS</small><strong id="security-sudo">0</strong></div></article>
+      <article class="panel quick-stat"><div><small>CRITICAL EVENTS</small><strong id="security-critical">0</strong></div></article>
+    </div>
+    <div class="filter-row"><select class="control" id="security-event-filter"><option value="">All event types</option><option value="ssh_login_failed">SSH failed</option><option value="ssh_login_success">SSH successful</option><option value="sudo_command">Sudo commands</option><option value="user_account_change">User changes</option><option value="firewall_change">Firewall changes</option><option value="fail2ban_ban">Fail2ban bans</option><option value="sensitive_file_modified">Sensitive file changes</option><option value="ssh_bruteforce_suspected">Brute-force detections</option></select><button class="control" id="security-refresh" type="button">Refresh events</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Severity</th><th>Event</th><th>User</th><th>Source IP</th><th>Details</th></tr></thead><tbody id="security-events-body"><tr><td colspan="6">Waiting for security events…</td></tr></tbody></table></div>
+    <p class="section-note">Monitoring is read-only. Firewall rules, user accounts, SSH settings, and Fail2ban are never modified automatically.</p>
+  </section>
+  <section class="panel compact-section" id="settings"><div class="section-head"><h2>Dashboard Settings</h2><span class="section-note">Editable monitoring thresholds and exclusions</span></div><form id="settings-form" class="settings-form"><div class="settings-grid"><label><small>CPU WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-cpu-warning" required></label><label><small>CPU CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-cpu-critical" required></label><label><small>MEMORY WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-memory-warning" required></label><label><small>MEMORY CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-memory-critical" required></label><label><small>DISK WARNING (%)</small><input class="control" type="number" min="0" max="99" step="1" id="setting-disk-warning" required></label><label><small>DISK CRITICAL (%)</small><input class="control" type="number" min="1" max="100" step="1" id="setting-disk-critical" required></label></div><label><small>DASHBOARD REFRESH INTERVAL (SECONDS, 1–300)</small><input class="control" type="number" min="1" max="300" step="1" id="setting-refresh-interval" required></label><label class="exclude-label"><small>EXCLUDED MOUNT POINTS (ONE PER LINE)</small><textarea class="control" id="setting-excluded-mounts" rows="3" placeholder="/mnt/c&#10;/mnt/d"></textarea></label><fieldset class="service-settings"><legend>MONITORED SERVICES</legend><label><input type="checkbox" id="setting-service-ssh"> SSH</label><label><input type="checkbox" id="setting-service-sshd"> SSHD</label><label><input type="checkbox" id="setting-service-docker"> Docker</label><label><input type="checkbox" id="setting-service-nginx"> Nginx</label></fieldset><div class="settings-actions"><button class="control primary-control" type="submit">Save settings</button><span id="settings-status" class="section-note" role="status">Loading settings…</span></div></form></section>
   <section class="panel compact-section" id="json-report"><details><summary>View complete JSON report</summary><pre>__RAW_JSON__</pre></details></section>
   <footer>Linux Server Health Monitor · Version __VERSION__ · Generated __GENERATED__</footer>
 </main>
@@ -1877,6 +2234,7 @@ body[data-page] .main > footer{display:block}
         "__NETWORK_ROWS__": "".join(network_rows),
         "__SERVICE_ROWS__": "".join(service_rows),
         "__SOCKET_ROWS__": "".join(socket_rows),
+        "__CONNECTION_ROWS__": "".join(connection_rows),
         "__UNIT_ROWS__": "".join(unit_rows),
         "__HISTORY_ROWS__": "".join(history_rows),
         "__ERRORS__": log_list("errors"),

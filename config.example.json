@@ -1,0 +1,43 @@
+{
+  "thresholds": {
+    "cpu": {
+      "warning": 70,
+      "critical": 90
+    },
+    "memory": {
+      "warning": 75,
+      "critical": 90
+    },
+    "disk": {
+      "warning": 80,
+      "critical": 95
+    },
+    "disk_io": {
+      "read_warning_mbps": 100,
+      "read_critical_mbps": 200,
+      "write_warning_mbps": 100,
+      "write_critical_mbps": 200
+    }
+  },
+  "health": {
+    "exclude_mountpoints": []
+  },
+  "services": {
+    "ssh": {
+      "enabled": true,
+      "unit": "ssh"
+    },
+    "sshd": {
+      "enabled": false,
+      "unit": "sshd"
+    },
+    "docker": {
+      "enabled": true,
+      "unit": "docker"
+    },
+    "nginx": {
+      "enabled": true,
+      "unit": "nginx"
+    }
+  }
+}

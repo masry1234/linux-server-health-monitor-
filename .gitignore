@@ -55,3 +55,11 @@ report.html
 *.backup
 *.backup*
 *_v0.6*.py
+
+# SQLite runtime history
+health_history.sqlite3
+health_history.sqlite3-shm
+health_history.sqlite3-wal
+
+security_monitor_state.json
+security_file_baseline.json

@@ -10,6 +10,45 @@ from unittest.mock import patch
 import health_monitor
 
 
+class MacAddressMaskingTests(unittest.TestCase):
+    def test_masks_valid_mac_address(self):
+        report = {
+            "network": [
+                {
+                    "name": "eth0",
+                    "state": "UP",
+                    "mac_address": "AA:BB:CC:11:22:33",
+                    "ipv4": [],
+                }
+            ],
+            "health": {},
+            "system": {},
+        }
+
+        html = health_monitor.generate_html_report(report)
+
+        self.assertIn("xx:xx:xx:xx:xx:xx", html)
+        self.assertNotIn("AA:BB:CC:11:22:33", html)
+
+    def test_mask_mac_is_applied_in_html_report(self):
+        report = {
+            "network": [
+                {
+                    "name": "eth0",
+                    "state": "UP",
+                    "mac_address": "AA:BB:CC:11:22:33",
+                    "ipv4": [],
+                }
+            ],
+            "health": {},
+            "system": {},
+        }
+
+        html = health_monitor.generate_html_report(report)
+
+        self.assertNotIn("AA:BB:CC:11:22:33", html)
+
+
 class SystemDiagnosticsTests(unittest.TestCase):
     def test_degraded_systemd_state(self):
         mocked_result = unittest.mock.Mock(
@@ -399,6 +438,7 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("Systemd status: degraded", result)
         self.assertIn("test-server", result)
         self.assertIn("View complete JSON report", result)
+        self.assertIn("Timestamp (Local)", result)
 
     def test_html_report_escapes_untrusted_content(self):
         report = {
@@ -479,6 +519,8 @@ class HistoryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             history_file = Path(directory) / "health_history.jsonl"
+            history_db = Path(directory) / "health_history.sqlite3"
+
             history_file.write_text(
                 json.dumps(valid_report) + "\n"
                 "{invalid json}\n"
@@ -487,7 +529,10 @@ class HistoryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.object(health_monitor, "HISTORY_FILE", history_file):
+            with (
+                patch.object(health_monitor, "HISTORY_FILE", history_file),
+                patch.object(health_monitor, "HISTORY_DB_FILE", history_db),
+            ):
                 reports = health_monitor.load_report_history()
 
         self.assertEqual(len(reports), 2)
@@ -503,16 +548,20 @@ class HistoryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             history_file = Path(directory) / "health_history.jsonl"
+            history_db = Path(directory) / "health_history.sqlite3"
+
             history_file.write_text(
                 "".join(json.dumps(report) + "\n" for report in reports_data),
                 encoding="utf-8",
             )
 
-            with patch.object(health_monitor, "HISTORY_FILE", history_file):
+            with (
+                patch.object(health_monitor, "HISTORY_FILE", history_file),
+                patch.object(health_monitor, "HISTORY_DB_FILE", history_db),
+            ):
                 reports = health_monitor.load_report_history(limit=2)
 
         self.assertEqual([report["id"] for report in reports], [2, 3])
-
 
 class ServiceTests(unittest.TestCase):
     def test_active_service_returns_ok(self):
@@ -839,3 +888,51 @@ class NetworkIOMetricsTests(unittest.TestCase):
         self.assertEqual(result["total_tx_bytes"], 3_000_000)
 
 
+
+
+class SQLiteHistoryTests(unittest.TestCase):
+    def test_save_and_load_reports_uses_sqlite_and_migrates_legacy_jsonl(self):
+        report_one = {"timestamp_utc": "2026-11-01T00:00:00Z", "health": {"status": "OK"}}
+        report_two = {"timestamp_utc": "2026-11-02T00:00:00Z", "health": {"status": "WARNING"}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "health_history.jsonl"
+            database = root / "health_history.sqlite3"
+            legacy.write_text(json.dumps(report_one) + "\n", encoding="utf-8")
+            with patch.object(health_monitor, "HISTORY_FILE", legacy), patch.object(
+                health_monitor, "HISTORY_DB_FILE", database
+            ):
+                health_monitor.save_report_history(report_two)
+                reports = health_monitor.load_report_history(10)
+        self.assertEqual([item["health"]["status"] for item in reports], ["OK", "WARNING"])
+
+
+class NetworkConnectionTests(unittest.TestCase):
+    def test_network_connections_parses_established_endpoints(self):
+        output = "0 0 192.0.2.10:22 198.51.100.5:54000\n"
+        with patch("health_monitor.run_command", return_value=output):
+            result = health_monitor.get_network_connections()
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["items"][0]["local_address"], "192.0.2.10:22")
+        self.assertEqual(result["items"][0]["peer_address"], "198.51.100.5:54000")
+
+    def test_network_connections_returns_unavailable_when_ss_missing(self):
+        with patch("health_monitor.run_command", return_value=None):
+            result = health_monitor.get_network_connections()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["count"])
+
+
+class PerCoreCpuTests(unittest.TestCase):
+    def test_per_core_cpu_usage_is_calculated(self):
+        first = "cpu0 100 0 100 700 0 0 0 0 0 0\ncpu1 100 0 100 700 0 0 0 0 0 0\n"
+        second = "cpu0 150 0 150 800 0 0 0 0 0 0\ncpu1 120 0 120 860 0 0 0 0 0 0\n"
+        with patch("builtins.open", side_effect=[io.StringIO(first), io.StringIO(second)]), patch(
+            "health_monitor.time.sleep"
+        ):
+            result = health_monitor.get_cpu_usage_per_core()
+        self.assertEqual(result, {"cpu0": 50.0, "cpu1": 20.0})
+
+    def test_per_core_cpu_rejects_non_positive_interval(self):
+        with self.assertRaises(ValueError):
+            health_monitor.get_cpu_usage_per_core(0)
