@@ -1607,6 +1607,16 @@ def generate_html_report(report, history=None):
 
     def esc(value):
         return html.escape(str(value if value is not None else "unknown"))
+    def mask_mac(value):
+        mac = str(value).strip() if value is not None else ""
+        if not mac:
+            return "unknown"
+
+        parts = mac.replace("-", ":").split(":")
+        if len(parts) != 6:
+            return "xx:xx:xx:xx:xx:xx"
+
+        return ":".join(["xx"] * 6)
 
     def status_class(value):
         normalized = str(value).lower()
@@ -1722,7 +1732,7 @@ def generate_html_report(report, history=None):
             "<tr>"
             f"<td>{esc(interface.get('name'))}</td>"
             f"<td>{esc(interface.get('state'))}</td>"
-            f"<td>{esc(interface.get('mac_address'))}</td>"
+            f"<td>{esc(mask_mac(interface.get('mac_address')))}</td>"
             f"<td>{esc(', '.join(interface.get('ipv4', [])) or 'N/A')}</td>"
             f"<td>{esc(net_rates.get('rx_mbps', 0))} MB/s</td>"
             f"<td>{esc(net_rates.get('tx_mbps', 0))} MB/s</td>"
@@ -1846,7 +1856,14 @@ def generate_html_report(report, history=None):
         )
 
 
-    raw_json = esc(json.dumps(report, indent=2, ensure_ascii=False))
+    safe_report = json.loads(json.dumps(report))
+    for interface in safe_report.get("network", []):
+        if isinstance(interface, dict):
+            interface["mac_address"] = mask_mac(
+                interface.get("mac_address")
+            )
+
+    raw_json = esc(json.dumps(safe_report, indent=2, ensure_ascii=False))
 
     disk_values = [
         item.get("usage_percent")

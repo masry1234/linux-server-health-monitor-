@@ -10,6 +10,45 @@ from unittest.mock import patch
 import health_monitor
 
 
+class MacAddressMaskingTests(unittest.TestCase):
+    def test_masks_valid_mac_address(self):
+        report = {
+            "network": [
+                {
+                    "name": "eth0",
+                    "state": "UP",
+                    "mac_address": "AA:BB:CC:11:22:33",
+                    "ipv4": [],
+                }
+            ],
+            "health": {},
+            "system": {},
+        }
+
+        html = health_monitor.generate_html_report(report)
+
+        self.assertIn("xx:xx:xx:xx:xx:xx", html)
+        self.assertNotIn("AA:BB:CC:11:22:33", html)
+
+    def test_mask_mac_is_applied_in_html_report(self):
+        report = {
+            "network": [
+                {
+                    "name": "eth0",
+                    "state": "UP",
+                    "mac_address": "AA:BB:CC:11:22:33",
+                    "ipv4": [],
+                }
+            ],
+            "health": {},
+            "system": {},
+        }
+
+        html = health_monitor.generate_html_report(report)
+
+        self.assertNotIn("AA:BB:CC:11:22:33", html)
+
+
 class SystemDiagnosticsTests(unittest.TestCase):
     def test_degraded_systemd_state(self):
         mocked_result = unittest.mock.Mock(
